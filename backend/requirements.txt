@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+sqlalchemy
+aiosqlite
+psycopg2-binary
+asyncpg
+python-jose[cryptography]
+bcrypt
+python-multipart
+websockets
+python-dotenv
+google-genai
+requests
+email-validator
+httpx
+ultralytics
+numpy

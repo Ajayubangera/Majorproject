@@ -1,0 +1,12 @@
+{
+  "name": "majorpjt-root",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "start": "npx -y concurrently -k \"npm run backend\" \"npm run dev\"",
+    "backend": "backend\\venv\\Scripts\\python -m uvicorn main:app --app-dir backend --host 0.0.0.0 --port 8000 --reload",
+    "dev": "npm run dev --prefix frontend",
+    "build": "npm run build --prefix frontend",
+    "install-frontend": "npm install --prefix frontend"
+  }
+}
