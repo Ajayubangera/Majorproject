@@ -74,7 +74,7 @@ You can run the application in two ways:
 ### Option A: Run Both Frontend & Backend Concurrently (Recommended)
 From the project root directory, simply run:
 ```bash
-npm start
+npm run start
 ```
 This will automatically launch:
 - **Backend API**: `http://localhost:8000`
