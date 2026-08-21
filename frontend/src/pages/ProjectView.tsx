@@ -5,31 +5,69 @@ import {
   Maximize2, ZoomIn, ZoomOut, RefreshCw, Wifi, WifiOff, Edit
 } from "lucide-react";
 import { getCurrentUser } from "../utils/auth";
+import { getViolenceLevel, getViolenceConfig, type ViolenceFilterType } from "../utils/threatUtils";
 
 const parseUTCDate = (dateStr?: string) => {
   if (!dateStr) return null;
   let standardized = dateStr.trim();
-  if (!standardized.includes("T") && !standardized.includes("Z")) {
-    standardized = standardized.replace(" ", "T") + "Z";
-  } else if (standardized.includes("T") && !standardized.endsWith("Z") && !standardized.includes("+") && !standardized.includes("-")) {
+  if (!standardized) return null;
+
+  // If it already ends with Z or has an explicit timezone offset like +05:30, -04:00
+  if (standardized.endsWith("Z") || /[+-]\d{2}:?\d{2}$/.test(standardized)) {
+    const d = new Date(standardized);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  // Naive date/time strings from database are stored in UTC; format with T and Z
+  standardized = standardized.replace(" ", "T");
+  if (!standardized.endsWith("Z")) {
     standardized = standardized + "Z";
   }
   const d = new Date(standardized);
   return isNaN(d.getTime()) ? null : d;
 };
 
+const formatTime12H = (isoOrTs?: string | Date | null) => {
+  if (!isoOrTs) return "N/A";
+  try {
+    const d = isoOrTs instanceof Date ? isoOrTs : parseUTCDate(isoOrTs);
+    if (d && !isNaN(d.getTime())) {
+      return new Intl.DateTimeFormat("en-US", {
+        timeZone: "Asia/Kolkata",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true,
+      }).format(d);
+    }
+  } catch (e) {}
+  return typeof isoOrTs === "string" ? isoOrTs : "N/A";
+};
+
+const formatDate = (isoOrTs?: string | Date | null) => {
+  if (!isoOrTs) return "N/A";
+  try {
+    const d = isoOrTs instanceof Date ? isoOrTs : parseUTCDate(isoOrTs);
+    if (d && !isNaN(d.getTime())) {
+      return new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(d); // Outputs YYYY-MM-DD in IST
+    }
+  } catch (e) {}
+  return typeof isoOrTs === "string" ? isoOrTs : "N/A";
+};
+
 const formatDateTime = (isoOrTs?: string) => {
   if (!isoOrTs) return "";
   try {
     const d = parseUTCDate(isoOrTs);
-    if (d) {
-      const year = d.getFullYear();
-      const month = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      const hours = String(d.getHours()).padStart(2, '0');
-      const minutes = String(d.getMinutes()).padStart(2, '0');
-      const seconds = String(d.getSeconds()).padStart(2, '0');
-      return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+    if (d && !isNaN(d.getTime())) {
+      const datePart = formatDate(d);
+      const timePart = formatTime12H(d);
+      return `${datePart} ${timePart}`;
     }
   } catch (e) {}
   return isoOrTs;
@@ -106,6 +144,7 @@ export default function ProjectView() {
   const [showMemberModal, setShowMemberModal] = useState(false);
   const [showLogsDrawer, setShowLogsDrawer] = useState(false);
   const [filterDate, setFilterDate] = useState("");
+  const [violenceFilter, setViolenceFilter] = useState<ViolenceFilterType>("all");
   const [activePopupAlert, setActivePopupAlert] = useState<any | null>(null);
   const [selectedEvidenceAlert, setSelectedEvidenceAlert] = useState<any | null>(null);
   const [newMemberEmail, setNewMemberEmail] = useState("");
@@ -209,8 +248,9 @@ export default function ProjectView() {
   // Canvas streams references
   const canvasRefs = useRef<Record<string, HTMLCanvasElement | null>>({});
 
-  // Persisted stream loading states to prevent connection drop on zoom/maximize
-  const streamImagesRef = useRef<Record<string, HTMLImageElement>>({});
+  // Hardware-accelerated frame bitmap buffer per camera to completely prevent Chromium MJPEG stream freezing
+  const latestBitmapsRef = useRef<Record<string, ImageBitmap | HTMLImageElement | null>>({});
+  const activeStreamLoopsRef = useRef<Record<string, boolean>>({});
   const streamConnectedRef = useRef<Record<string, boolean>>({});
   const streamStartTimeRef = useRef<Record<string, number>>({});
   const lastFrameTimeRef = useRef<Record<string, number>>({});
@@ -272,7 +312,7 @@ export default function ProjectView() {
 
     fetchWorkspace();
 
-    // Poll alert registry every 2 seconds (Registry Update Syncing Speed)
+    // Gentle background alert registry sync (every 10 seconds — WebSocket handles instantaneous events)
     const alertsPollInterval = setInterval(async () => {
       try {
         const response = await fetch(`${API_BASE}/api/projects/${id}/alerts`);
@@ -291,27 +331,29 @@ export default function ProjectView() {
                 delete copy[camId];
               }
             }
-            // Auto-add new alerts is removed to prevent persistent/startup active warning overlays
             return copy;
           });
         }
       } catch (err) {
         console.error("Alert registry polling failed:", err);
       }
-    }, 2000);
+    }, 10000);
 
-    // Poll camera configurations every 2 seconds (Camera Config Syncing Speed)
+    // Sync camera configurations using lightweight cameras endpoint every 10 seconds
     const camerasPollInterval = setInterval(async () => {
       try {
-        const response = await fetch(`${API_BASE}/api/projects/${id}`);
+        const response = await fetch(`${API_BASE}/api/projects/${id}/cameras`);
         if (response.ok) {
           const data = await response.json();
-          setCameras(data.cameras);
+          setCameras(prev => {
+            if (JSON.stringify(prev) === JSON.stringify(data)) return prev;
+            return data;
+          });
         }
       } catch (err) {
         console.error("Camera configuration polling failed:", err);
       }
-    }, 2000);
+    }, 10000);
 
     // ─── WebSocket with auto-reconnect (exponential backoff) ─────────────
     const handleWsMessage = (event: MessageEvent) => {
@@ -405,6 +447,9 @@ export default function ProjectView() {
       } else if (payload.event === "all_alerts_trashed") {
         setAlerts(prev => prev.map(a => ({ ...a, is_trashed: true })));
         setActiveAlerts({});
+      } else if (payload.event === "all_alerts_resolved") {
+        setAlerts(prev => prev.map(a => ({ ...a, is_resolved: true })));
+        setActiveAlerts({});
       } else if (payload.event === "all_trash_deleted") {
         setAlerts(prev => prev.filter(a => !a.is_trashed));
       }
@@ -418,7 +463,7 @@ export default function ProjectView() {
 
       ws.onopen = () => {
         console.log("WebSocket connection established with FastAPI Server");
-        wsReconnectDelayRef.current = 1000; // Reset backoff on successful connect
+        wsReconnectDelayRef.current = 1000;
         ws.send(JSON.stringify({ type: "ping" }));
       };
 
@@ -431,7 +476,6 @@ export default function ProjectView() {
       ws.onclose = () => {
         console.log("WebSocket stream closed.");
         if (!wsIntentionalCloseRef.current) {
-          // Auto-reconnect with exponential backoff (cap at 30s)
           const delay = wsReconnectDelayRef.current;
           console.log(`WebSocket reconnecting in ${delay}ms...`);
           wsReconnectTimerRef.current = window.setTimeout(() => {
@@ -456,7 +500,7 @@ export default function ProjectView() {
     };
   }, [id, currentUser, navigate, soundEnabled]);
 
-  // Centralized camera status polling (once every 3 seconds)
+  // Centralized camera status polling (once every 2 seconds)
   useEffect(() => {
     if (!id || cameras.length === 0) return;
 
@@ -474,6 +518,9 @@ export default function ProjectView() {
               if (prev[cam.id] !== isOffline) {
                 changed = true;
               }
+              if (isOffline) {
+                streamConnectedRef.current[cam.id] = false;
+              }
             });
             return changed ? newOffline : prev;
           });
@@ -484,77 +531,159 @@ export default function ProjectView() {
     };
 
     checkCameraStatus(); // Initial run
-    const intervalId = setInterval(checkCameraStatus, 3000);
+    const intervalId = setInterval(checkCameraStatus, 2000);
     return () => clearInterval(intervalId);
   }, [id, cameras]);
 
-  // Canvas drawing loop simulation
+  // ─── Stable Frame Polling Engine (long-lived, only restarts when cameras change) ───
   useEffect(() => {
     if (cameras.length === 0) return;
 
-    const activeAnimationFlags: Record<string, boolean> = {};
-    const particles: Record<string, Array<{ x: number; y: number; vx: number; vy: number }>> = {};
-
-    // Access persistent refs to prevent connection drops on layout shifts (maximizing)
-    const streamImages = streamImagesRef.current;
     const streamConnected = streamConnectedRef.current;
     const streamStartTime = streamStartTimeRef.current;
     const lastFrameTime = lastFrameTimeRef.current;
     const pingIntervals = pingIntervalsRef.current;
-    const GRACE_PERIOD_MS = 5000; // Don't show NO SIGNAL for 5s after stream init
+    const latestBitmaps = latestBitmapsRef.current;
+    const activeStreamLoops = activeStreamLoopsRef.current;
 
     cameras.forEach(cam => {
-      activeAnimationFlags[cam.id] = true;
-      // Initialize small moving particles to simulate movement in streams
+      const isDisconnected = !cam.ai_active;
+      if (isDisconnected) {
+        streamConnected[cam.id] = false;
+        activeStreamLoops[cam.id] = false;
+        const oldBmp = latestBitmaps[cam.id];
+        if (oldBmp && "close" in oldBmp) {
+          (oldBmp as ImageBitmap).close();
+        }
+        delete latestBitmaps[cam.id];
+        return;
+      }
+
+      // Skip if a polling loop is already running for this camera
+      if (activeStreamLoops[cam.id]) return;
+
+      // Continuous Zero-Freeze Frame Streamer
+      activeStreamLoops[cam.id] = true;
+      streamStartTime[cam.id] = Date.now();
+
+      let inFlight = false;
+      const pollFrame = async () => {
+        if (!activeStreamLoops[cam.id]) return;
+        if (inFlight) return;
+        inFlight = true;
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1800);
+
+        try {
+          const res = await fetch(`${API_BASE}/api/cameras/${cam.id}/frame`, {
+            cache: "no-store",
+            headers: { "Pragma": "no-cache" },
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+
+          if (res.ok) {
+            const isCamOnline = res.headers.get("X-Cam-Connected") !== "0";
+            streamConnected[cam.id] = isCamOnline;
+            
+            if (isCamOnline) {
+              const blob = await res.blob();
+              if (blob.size > 0 && activeStreamLoops[cam.id]) {
+                try {
+                  if (typeof createImageBitmap === "function") {
+                    const newBitmap = await createImageBitmap(blob);
+                    const prev = latestBitmaps[cam.id];
+                    latestBitmaps[cam.id] = newBitmap;
+                    if (prev && "close" in prev) {
+                      (prev as ImageBitmap).close();
+                    }
+                  } else {
+                    const img = new Image();
+                    const url = URL.createObjectURL(blob);
+                    img.onload = () => {
+                      latestBitmaps[cam.id] = img;
+                      URL.revokeObjectURL(url);
+                    };
+                    img.src = url;
+                  }
+                  lastFrameTime[cam.id] = Date.now();
+                } catch (bmpErr) {
+                  // Fallback
+                }
+              }
+            } else {
+              // Camera offline on backend
+              const prev = latestBitmaps[cam.id];
+              if (prev && "close" in prev) {
+                (prev as ImageBitmap).close();
+              }
+              latestBitmaps[cam.id] = null;
+            }
+          } else {
+            streamConnected[cam.id] = false;
+          }
+        } catch (netErr) {
+          streamConnected[cam.id] = false;
+        } finally {
+          clearTimeout(timeoutId);
+          inFlight = false;
+          if (activeStreamLoops[cam.id]) {
+            // Schedule next frame (~30 FPS rate = 33ms interval)
+            setTimeout(pollFrame, 33);
+          }
+        }
+      };
+
+      pollFrame();
+
+      // Frame Heartbeat Watchdog: If frame hasn't updated for > 2.5s while active, re-arm polling
+      const watchdog = setInterval(() => {
+        if (!activeStreamLoops[cam.id] || !cam.ai_active) return;
+        if (Date.now() - (lastFrameTime[cam.id] || 0) > 2500) {
+          inFlight = false;
+          pollFrame();
+        }
+      }, 2000);
+      pingIntervals.push(watchdog as unknown as number);
+    });
+
+    return () => {
+      cameras.forEach(cam => {
+        activeStreamLoops[cam.id] = false;
+        const bmp = latestBitmaps[cam.id];
+        if (bmp && "close" in bmp) {
+          (bmp as ImageBitmap).close();
+        }
+        delete latestBitmaps[cam.id];
+      });
+      pingIntervals.forEach(clearInterval);
+      pingIntervalsRef.current = [];
+    };
+  }, [cameras]);
+
+  // ─── Canvas Drawing / Render Loop (cheap to restart, depends on visual state) ───
+  useEffect(() => {
+    if (cameras.length === 0) return;
+
+    let animRunning = true;
+    const particles: Record<string, Array<{ x: number; y: number; vx: number; vy: number }>> = {};
+
+    cameras.forEach(cam => {
       particles[cam.id] = Array.from({ length: 3 }, () => ({
         x: Math.random() * 200 + 50,
         y: Math.random() * 120 + 40,
         vx: (Math.random() - 0.5) * 1.5,
         vy: (Math.random() - 0.5) * 1.5
       }));
-
-      // Load live HTTP stream if configured
-      const isDisconnected = !cam.ai_active;
-      
-      const updateStatus = (camId: string, isOk: boolean) => {
-        streamConnected[camId] = isOk;
-        if (isOk) lastFrameTime[camId] = Date.now();
-        setOfflineCameras(prev => {
-          if (prev[camId] === !isOk) return prev;
-          return { ...prev, [camId]: !isOk };
-        });
-      };
-
-      if (isDisconnected) {
-        if (streamImages[cam.id]) {
-          streamImages[cam.id].src = "";
-          delete streamImages[cam.id];
-        }
-        streamConnected[cam.id] = false;
-        updateStatus(cam.id, false);
-      } else {
-        const backendStreamUrl = `${API_BASE}/api/cameras/${cam.id}/stream`;
-        const existingImg = streamImages[cam.id];
-        const existingBaseSrc = existingImg ? existingImg.src.split('?')[0] : '';
-        if (!existingImg || existingBaseSrc !== backendStreamUrl) {
-          streamStartTime[cam.id] = Date.now();
-          const img = new Image();
-          img.onload = () => {
-            streamConnected[cam.id] = true;
-            lastFrameTime[cam.id] = Date.now();
-            updateStatus(cam.id, true);
-          };
-          img.onerror = () => {
-            streamConnected[cam.id] = false;
-            updateStatus(cam.id, false);
-          };
-          img.src = backendStreamUrl;
-          streamImages[cam.id] = img;
-        }
-      }
     });
 
+    const streamConnected = streamConnectedRef.current;
+    const latestBitmaps = latestBitmapsRef.current;
+
     const drawFrame = () => {
+      if (!animRunning) return;
+
       cameras.forEach((cam) => {
         const targetCanvases: HTMLCanvasElement[] = [];
         
@@ -603,85 +732,58 @@ export default function ProjectView() {
             return;
           }
 
-          // Try to draw the real HTTP MJPEG stream
-          const liveImg = streamImages[cam.id];
+          // Draw the real zero-freeze hardware frame
+          const isOffline = offlineCameras[cam.id] === true || streamConnected[cam.id] === false;
+          const frameBitmap = latestBitmaps[cam.id];
           let streamLoaded = false;
 
-          if (liveImg && streamConnected[cam.id] !== false) {
+          if (!isOffline && frameBitmap) {
             try {
-              if (liveImg.naturalWidth > 0) {
-                ctx.drawImage(liveImg, 0, 0, w, h);
-                streamLoaded = true;
-                lastFrameTime[cam.id] = Date.now();
-                streamConnected[cam.id] = true;
-              }
+              ctx.drawImage(frameBitmap as CanvasImageSource, 0, 0, w, h);
+              streamLoaded = true;
             } catch (e) {
-              // Fallback if blocked by CORS or loading
+              // Frame rendering error fallback
             }
           }
 
-          const isOffline = offlineCameras[cam.id];
-          const isHttpStream = true;
-          const withinGracePeriod = (Date.now() - (streamStartTime[cam.id] || 0)) < GRACE_PERIOD_MS;
-          if (isOffline || (isHttpStream && !streamLoaded)) {
-            if (withinGracePeriod && !isOffline) {
-              // Show "CONNECTING" animation instead of NO SIGNAL during grace period
-              ctx.fillStyle = "#0c0721";
-              ctx.fillRect(0, 0, w, h);
+          if (isOffline || !streamLoaded) {
+            // Draw Retro CCTV No Signal & Auto-Reconnecting slate (visible only when camera is disconnected)
+            ctx.fillStyle = "#0c0721";
+            ctx.fillRect(0, 0, w, h);
 
-              // Subtle grid
-              ctx.strokeStyle = "rgba(139, 92, 246, 0.06)";
-              ctx.lineWidth = 1;
-              for (let i = 0; i < w; i += 20) {
-                ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, h); ctx.stroke();
-              }
-              for (let j = 0; j < h; j += 20) {
-                ctx.beginPath(); ctx.moveTo(0, j); ctx.lineTo(w, j); ctx.stroke();
-              }
-
-              // Animated dots
-              const dotCount = (Math.floor(Date.now() / 400) % 4);
-              const dots = ".".repeat(dotCount);
-              ctx.fillStyle = "#a78bfa";
-              ctx.font = "bold 14px monospace";
-              ctx.fillText(`CONNECTING${dots}`, w / 2 - 50, h / 2);
-              ctx.fillStyle = "rgba(255,255,255,0.35)";
-              ctx.font = "9px monospace";
-              ctx.fillText("ESTABLISHING CAMERA LINK", w / 2 - 70, h / 2 + 18);
-            } else {
-              // Draw Retro CCTV No Signal slate (past grace period or offline)
-              ctx.fillStyle = "#110b29";
-              ctx.fillRect(0, 0, w, h);
-
-              ctx.strokeStyle = "rgba(239, 68, 68, 0.08)";
-              ctx.lineWidth = 1;
-              for (let i = 0; i < w; i += 20) {
-                ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, h); ctx.stroke();
-              }
-              for (let j = 0; j < h; j += 20) {
-                ctx.beginPath(); ctx.moveTo(0, j); ctx.lineTo(w, j); ctx.stroke();
-              }
-
-              const blink = Math.floor(Date.now() / 600) % 2 === 0;
-              if (blink) {
-                ctx.fillStyle = "#ef4444";
-                ctx.beginPath();
-                ctx.arc(w / 2 - 55, h / 2 - 4, 6, 0, 2 * Math.PI);
-                ctx.fill();
-              }
-
-              ctx.fillStyle = "#ef4444";
-              ctx.font = "bold 16px monospace";
-              ctx.fillText("NO SIGNAL", w / 2 - 35, h / 2 + 1);
-
-              ctx.fillStyle = "#a5b4fc";
-              ctx.font = "10px monospace";
-              ctx.fillText("AUTO-RECONNECTING...", w / 2 - 58, h / 2 + 20);
-
-              ctx.fillStyle = "rgba(255, 255, 255, 0.3)";
-              ctx.font = "9px monospace";
-              ctx.fillText(`URL: ${cam.rtsp_url}`, 15, h - 15);
+            // Grid
+            ctx.strokeStyle = "rgba(239, 68, 68, 0.08)";
+            ctx.lineWidth = 1;
+            for (let i = 0; i < w; i += 20) {
+              ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, h); ctx.stroke();
             }
+            for (let j = 0; j < h; j += 20) {
+              ctx.beginPath(); ctx.moveTo(0, j); ctx.lineTo(w, j); ctx.stroke();
+            }
+
+            // Blinking red status indicator
+            const blink = Math.floor(Date.now() / 500) % 2 === 0;
+            if (blink) {
+              ctx.fillStyle = "#ef4444";
+              ctx.beginPath();
+              ctx.arc(w / 2 - 58, h / 2 - 6, 6, 0, 2 * Math.PI);
+              ctx.fill();
+            }
+
+            ctx.fillStyle = "#ef4444";
+            ctx.font = "bold 15px monospace";
+            ctx.fillText("NO SIGNAL", w / 2 - 40, h / 2);
+
+            // Animated auto-reconnecting dots
+            const dotCount = Math.floor(Date.now() / 400) % 4;
+            const dots = ".".repeat(dotCount);
+            ctx.fillStyle = "#a5b4fc";
+            ctx.font = "bold 11px monospace";
+            ctx.fillText(`AUTO-RECONNECTING${dots}`, w / 2 - 62, h / 2 + 22);
+
+            ctx.fillStyle = "rgba(255, 255, 255, 0.35)";
+            ctx.font = "9px monospace";
+            ctx.fillText(`STREAM: ${cam.rtsp_url}`, 12, h - 14);
             return;
           }
 
@@ -701,74 +803,62 @@ export default function ProjectView() {
             ctx.stroke();
           }
 
-          // Draw perspective lines depending on zone tag to simulate structural layouts
+          // Draw perspective lines depending on zone tag
           ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
           ctx.beginPath();
-          if (cam.zone_tag === "Corridor") {
-            // Hallway perspective lines
+          if ((cam.zone_tag || "") === "Corridor") {
             ctx.moveTo(20, h - 10); ctx.lineTo(w / 3, h / 2);
             ctx.moveTo(w - 20, h - 10); ctx.lineTo(2 * w / 3, h / 2);
             ctx.moveTo(w / 3, h / 2); ctx.lineTo(2 * w / 3, h / 2);
-          } else if (cam.zone_tag === "Playground" || cam.zone_tag === "Backyard") {
-            // Outdoor fields layout
+          } else if ((cam.zone_tag || "") === "Playground" || (cam.zone_tag || "") === "Backyard") {
             ctx.moveTo(0, h - 40); ctx.lineTo(w, h - 40);
             ctx.moveTo(w / 2, h - 40); ctx.lineTo(w / 2, h);
           } else {
-            // Standard room perspective
             ctx.moveTo(10, 10); ctx.lineTo(w - 10, 10);
             ctx.moveTo(10, h - 10); ctx.lineTo(w - 10, h - 10);
           }
           ctx.stroke();
 
-          // Update and draw normal simulated objects (e.g. green bounding box for humans)
+          // Anomaly visual overlay if active
           const activeAlert = activeAlerts[cam.id];
           
           if (activeAlert) {
-            // Anomaly active: Draw red flashing visual overlay
             ctx.fillStyle = "rgba(239, 68, 68, 0.08)";
             ctx.fillRect(0, 0, w, h);
 
-            // Pulsing danger frame
             ctx.strokeStyle = `rgba(239, 68, 68, ${Math.abs(Math.sin(Date.now() / 150))})`;
             ctx.lineWidth = 4;
             ctx.strokeRect(2, 2, w - 4, h - 4);
 
-            // Threat location indicator
             ctx.strokeStyle = "var(--danger)";
             ctx.lineWidth = 2;
             ctx.strokeRect(w / 2 - 40, h / 2 - 50, 80, 100);
             
-            // Bounding box text
             ctx.fillStyle = "var(--danger)";
             ctx.font = "bold 10px monospace";
             const labelText = activeAlert.anomaly_type ? `AI DETECT: ${activeAlert.anomaly_type.toUpperCase()}` : "AI DETECT: ANOMALY";
             ctx.fillText(labelText, w / 2 - 40, h / 2 - 56);
-            ctx.fillText(`CONF: ${(activeAlert.confidence_gemini * 100).toFixed(1)}%`, w / 2 - 40, h / 2 + 65);
+            ctx.fillText(`CONF: ${((activeAlert.confidence_gemini ?? 0) * 100).toFixed(1)}%`, w / 2 - 40, h / 2 + 65);
 
-            // Blinking Warning overlay text
             ctx.fillStyle = "#fff";
             ctx.font = "bold 12px sans-serif";
             const warningText = activeAlert.anomaly_type ? `⚠️ THREAT: ${activeAlert.anomaly_type.toUpperCase()} DETECTED` : "⚠️ THREAT ALERT VERIFIED";
             ctx.fillText(warningText, 15, 30);
             
           } else {
-            // Normal state: Update particles if no real stream is loaded
             if (!streamLoaded) {
               const camParticles = particles[cam.id] || [];
               camParticles.forEach(p => {
                 p.x += p.vx;
                 p.y += p.vy;
 
-                // Bounce check
                 if (p.x < 30 || p.x > w - 30) p.vx *= -1;
                 if (p.y < 30 || p.y > h - 30) p.vy *= -1;
 
-                // Draw bounding box
                 ctx.strokeStyle = "var(--success)";
                 ctx.lineWidth = 1.5;
                 ctx.strokeRect(p.x - 15, p.y - 25, 30, 50);
 
-                // Label
                 ctx.fillStyle = "var(--success)";
                 ctx.font = "8px monospace";
                 ctx.fillText("person 0.88", p.x - 15, p.y - 30);
@@ -776,7 +866,7 @@ export default function ProjectView() {
             }
           }
 
-          // Draw crosshair or compass markings
+          // Crosshair markings
           ctx.strokeStyle = "rgba(255, 255, 255, 0.15)";
           ctx.lineWidth = 1;
           ctx.beginPath();
@@ -790,13 +880,13 @@ export default function ProjectView() {
           ctx.textAlign = "left";
           ctx.fillText(`CAM_${cam.name.replace(/\s+/g, "_").toUpperCase()}`, 12, h - 14);
           ctx.textAlign = "right";
-          ctx.fillText(cam.zone_tag.toUpperCase(), w - 10, h - 14);
+          ctx.fillText((cam.zone_tag || "").toUpperCase(), w - 10, h - 14);
           ctx.textAlign = "left";
           
-          // Draw date/time overlay — top right, using textAlign=right to never go off-screen
+          // Date/time overlay in 12-hour format with hour, minute, second and AM/PM
           const now = new Date();
-          const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-          const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+          const dateStr = formatDate(now);
+          const timeStr = formatTime12H(now);
           ctx.save();
           ctx.textAlign = "right";
           ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
@@ -807,65 +897,18 @@ export default function ProjectView() {
           ctx.fillText(dateStr, w - 10, 34);
           ctx.restore();
 
-        }); // targetCanvases.forEach
-      }); // cameras.forEach
+        });
+      });
 
-      // Request next frame
       requestAnimationFrame(drawFrame);
     };
 
     drawFrame();
 
     return () => {
-      cameras.forEach(cam => {
-        activeAnimationFlags[cam.id] = false;
-      });
-      pingIntervals.forEach(clearInterval);
-      pingIntervalsRef.current = [];
+      animRunning = false;
     };
-  }, [cameras, activeAlerts, maximizedCameraId]);
-
-  // Periodic stream health check and auto-reconnect
-  useEffect(() => {
-    if (cameras.length === 0) return;
-
-    const interval = setInterval(() => {
-      cameras.forEach(cam => {
-        if (!cam.ai_active) return;
-
-        const isOffline = offlineCameras[cam.id];
-        const isStreamDown = streamConnectedRef.current[cam.id] === false;
-
-        // If the stream is marked down, or if the backend says the camera is offline,
-        // or if we haven't received a frame in a while (e.g. 5 seconds)
-        const timeSinceLastFrame = Date.now() - (lastFrameTimeRef.current[cam.id] || 0);
-        const needsReconnect = isStreamDown || isOffline || (timeSinceLastFrame > 5000);
-
-        if (needsReconnect) {
-          console.log(`Stream for camera ${cam.name} (${cam.id}) needs reconnect. Retrying...`);
-          
-          const backendStreamUrl = `${API_BASE}/api/cameras/${cam.id}/stream?t=${Date.now()}`;
-          const img = new Image();
-          
-          img.onload = () => {
-            console.log(`Stream reconnected successfully for camera ${cam.name}`);
-            streamConnectedRef.current[cam.id] = true;
-            lastFrameTimeRef.current[cam.id] = Date.now();
-            setOfflineCameras(prev => ({ ...prev, [cam.id]: false }));
-          };
-          
-          img.onerror = () => {
-            streamConnectedRef.current[cam.id] = false;
-          };
-          
-          img.src = backendStreamUrl;
-          streamImagesRef.current[cam.id] = img;
-        }
-      });
-    }, 3000);
-
-    return () => clearInterval(interval);
-  }, [cameras, offlineCameras]);
+  }, [cameras, activeAlerts, maximizedCameraId, offlineCameras]);
 
   // Audio alert trigger
   const playAlarmSound = () => {
@@ -916,8 +959,9 @@ export default function ProjectView() {
   // Download snapshot evidence raw file helper
   const handleDownloadSnapshot = async (alert: any) => {
     if (!alert || !alert.snapshot_url) return;
+    const resolvedUrl = getSnapshotUrl(alert.snapshot_url);
     try {
-      const response = await fetch(alert.snapshot_url);
+      const response = await fetch(resolvedUrl);
       const blob = await response.blob();
       const blobUrl = URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -929,7 +973,7 @@ export default function ProjectView() {
       URL.revokeObjectURL(blobUrl);
     } catch (err) {
       console.error("Failed to download raw snapshot:", err);
-      window.open(alert.snapshot_url, "_blank");
+      window.open(resolvedUrl, "_blank");
     }
   };
 
@@ -1947,47 +1991,182 @@ export default function ProjectView() {
               </div>
             </div>
 
-            {/* Date Search/Filter Bar */}
+            {/* Date Search & Violence Level Filter Bar */}
             <div style={{
               display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              marginBottom: "12px",
-              background: "rgba(255,255,255,0.02)",
-              border: "1px solid var(--border-glass)",
-              borderRadius: "var(--radius-md)",
-              padding: "6px 12px"
+              flexDirection: "column",
+              gap: "10px",
+              marginBottom: "14px"
             }}>
-              <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)", fontWeight: 600 }}>Filter Date:</span>
-              <input
-                type="date"
-                value={filterDate}
-                onChange={(e) => setFilterDate(e.target.value)}
-                style={{
-                  background: "transparent",
-                  border: "none",
-                  color: "#fff",
-                  fontSize: "0.8rem",
-                  outline: "none",
-                  flex: 1,
-                  colorScheme: "dark"
-                }}
-              />
-              {filterDate && (
-                <button
-                  onClick={() => setFilterDate("")}
+              {/* Date Filter Bar */}
+              <div style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                background: "rgba(255,255,255,0.02)",
+                border: "1px solid var(--border-glass)",
+                borderRadius: "var(--radius-md)",
+                padding: "6px 12px"
+              }}>
+                <span style={{ fontSize: "0.75rem", color: "var(--text-secondary)", fontWeight: 600 }}>Filter Date:</span>
+                <input
+                  type="date"
+                  value={filterDate}
+                  onChange={(e) => setFilterDate(e.target.value)}
                   style={{
                     background: "transparent",
                     border: "none",
-                    color: "var(--danger)",
-                    fontSize: "0.75rem",
-                    cursor: "pointer",
-                    fontWeight: 600
+                    color: "#fff",
+                    fontSize: "0.8rem",
+                    outline: "none",
+                    flex: 1,
+                    colorScheme: "dark"
                   }}
-                >
-                  Clear
-                </button>
-              )}
+                />
+                {filterDate && (
+                  <button
+                    onClick={() => setFilterDate("")}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      color: "var(--danger)",
+                      fontSize: "0.75rem",
+                      cursor: "pointer",
+                      fontWeight: 600
+                    }}
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+
+              {/* Violence Filter Button Bar */}
+              {(() => {
+                const nonTrashed = alerts.filter(a => !a.is_trashed);
+                const dateFiltered = nonTrashed.filter(alert => {
+                  if (!filterDate) return true;
+                  const d = parseUTCDate(alert.created_at || alert.timestamp);
+                  if (!d) return true;
+                  const year = d.getFullYear();
+                  const month = String(d.getMonth() + 1).padStart(2, '0');
+                  const day = String(d.getDate()).padStart(2, '0');
+                  return `${year}-${month}-${day}` === filterDate;
+                });
+
+                const counts = {
+                  all: dateFiltered.length,
+                  high: dateFiltered.filter(a => getViolenceLevel(a) === "high").length,
+                  medium: dateFiltered.filter(a => getViolenceLevel(a) === "medium").length,
+                  low: dateFiltered.filter(a => getViolenceLevel(a) === "low").length
+                };
+
+                const filterButtons: {
+                  id: ViolenceFilterType;
+                  label: string;
+                  dot?: string;
+                  color: string;
+                  activeBg: string;
+                  activeBorder: string;
+                  activeGlow: string;
+                }[] = [
+                  {
+                    id: "all",
+                    label: "All",
+                    color: "var(--text-primary)",
+                    activeBg: "rgba(255, 255, 255, 0.12)",
+                    activeBorder: "rgba(255, 255, 255, 0.3)",
+                    activeGlow: "rgba(255, 255, 255, 0.2)"
+                  },
+                  {
+                    id: "high",
+                    label: "High",
+                    dot: "#ef4444",
+                    color: "#ef4444",
+                    activeBg: "rgba(239, 68, 68, 0.2)",
+                    activeBorder: "#ef4444",
+                    activeGlow: "rgba(239, 68, 68, 0.45)"
+                  },
+                  {
+                    id: "medium",
+                    label: "Medium",
+                    dot: "#f97316",
+                    color: "#f97316",
+                    activeBg: "rgba(249, 115, 22, 0.2)",
+                    activeBorder: "#f97316",
+                    activeGlow: "rgba(249, 115, 22, 0.45)"
+                  },
+                  {
+                    id: "low",
+                    label: "Normal",
+                    dot: "#10b981",
+                    color: "#10b981",
+                    activeBg: "rgba(16, 185, 129, 0.2)",
+                    activeBorder: "#10b981",
+                    activeGlow: "rgba(16, 185, 129, 0.45)"
+                  }
+                ];
+
+                return (
+                  <div style={{
+                    display: "flex",
+                    alignItems: "center",
+                    background: "rgba(0, 0, 0, 0.35)",
+                    border: "1px solid var(--border-glass)",
+                    borderRadius: "6px",
+                    padding: "2px",
+                    gap: "3px"
+                  }}>
+                    {filterButtons.map(btn => {
+                      const isActive = violenceFilter === btn.id;
+                      return (
+                        <button
+                          key={btn.id}
+                          onClick={() => setViolenceFilter(prev => prev === btn.id ? "all" : btn.id)}
+                          title={`Filter by ${btn.label} violence level (${counts[btn.id]})`}
+                          style={{
+                            flex: 1,
+                            justifyContent: "center",
+                            background: isActive ? btn.activeBg : "transparent",
+                            border: isActive ? `1px solid ${btn.activeBorder}` : "1px solid transparent",
+                            boxShadow: isActive ? `0 0 8px ${btn.activeGlow}` : "none",
+                            color: isActive ? btn.color : "var(--text-secondary)",
+                            borderRadius: "4px",
+                            padding: "5px 4px",
+                            fontSize: "0.72rem",
+                            fontWeight: isActive ? 700 : 500,
+                            cursor: "pointer",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "4px",
+                            transition: "all 0.15s ease"
+                          }}
+                        >
+                          {btn.dot && (
+                            <span style={{
+                              width: "6px",
+                              height: "6px",
+                              borderRadius: "50%",
+                              background: btn.dot,
+                              boxShadow: isActive ? `0 0 6px ${btn.dot}` : "none"
+                            }} />
+                          )}
+                          <span>{btn.label}</span>
+                          <span style={{
+                            fontSize: "0.62rem",
+                            padding: "1px 4px",
+                            borderRadius: "8px",
+                            background: isActive ? "rgba(0, 0, 0, 0.4)" : "rgba(255, 255, 255, 0.08)",
+                            color: isActive ? btn.color : "var(--text-muted)",
+                            fontWeight: 700
+                          }}>
+                            {counts[btn.id]}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Move All to Trash — placed near filter bar */}
@@ -2032,14 +2211,20 @@ export default function ProjectView() {
               {(() => {
                 const filteredAlerts = alerts.filter(alert => {
                   if (alert.is_trashed) return false;
-                  if (!filterDate) return true;
-                  const d = parseUTCDate(alert.created_at || alert.timestamp);
-                  if (!d) return true;
-                  const year = d.getFullYear();
-                  const month = String(d.getMonth() + 1).padStart(2, '0');
-                  const day = String(d.getDate()).padStart(2, '0');
-                  const formattedAlertDate = `${year}-${month}-${day}`;
-                  return formattedAlertDate === filterDate;
+                  // 1. Date filter
+                  if (filterDate) {
+                    const d = parseUTCDate(alert.created_at || alert.timestamp);
+                    if (d) {
+                      const formattedAlertDate = formatDate(d);
+                      if (formattedAlertDate !== filterDate) return false;
+                    }
+                  }
+                  // 2. Violence filter
+                  if (violenceFilter !== "all") {
+                    const level = getViolenceLevel(alert);
+                    if (level !== violenceFilter) return false;
+                  }
+                  return true;
                 });
 
                 // Sort by parsed timestamp descending to ensure the latest are always on top
@@ -2056,7 +2241,9 @@ export default function ProjectView() {
                     <div style={{ textAlign: "center", color: "var(--text-muted)", marginTop: "40px" }}>
                       <ShieldCheck size={36} color="var(--success)" style={{ marginBottom: "12px", display: "inline-block" }} />
                       <p style={{ fontSize: "0.85rem" }}>
-                        {filterDate ? `No incidents logged on ${filterDate}.` : "Clear environment. No security threat anomalies verified today."}
+                        {filterDate || violenceFilter !== "all"
+                          ? `No ${violenceFilter !== "all" ? violenceFilter + "-violence " : ""}incidents match the selected filters${filterDate ? ` on ${filterDate}` : ""}.`
+                          : "Clear environment. No security threat anomalies verified today."}
                       </p>
                     </div>
                   );
@@ -2064,6 +2251,7 @@ export default function ProjectView() {
 
                 return filteredAlerts.map((alert) => {
                   const isHighlighted = highlightedCamId === alert.camera_id;
+                  const vConfig = getViolenceConfig(getViolenceLevel(alert));
                   
                   return (
                     <div 
@@ -2084,18 +2272,42 @@ export default function ProjectView() {
                       style={{
                         padding: "16px",
                         cursor: "pointer",
-                        borderLeft: alert.is_resolved ? "4px solid var(--success)" : "4px solid var(--danger)",
-                        background: alert.is_resolved ? "rgba(16,185,129,0.02)" : "rgba(239,68,68,0.03)"
+                        background: vConfig.bg,
+                        border: `1px solid ${vConfig.border}`,
+                        borderLeft: `4px solid ${vConfig.color}`,
+                        borderRadius: "var(--radius-md)"
                       }}
                     >
-                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
-                        <span style={{
-                          fontWeight: 700,
-                          fontSize: "0.8rem",
-                          color: alert.is_resolved ? "var(--success)" : "var(--danger)"
-                        }}>
-                          {alert.is_resolved ? "RESOLVED THREAT" : "UNRESOLVED THREAT"}
-                        </span>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px", alignItems: "center" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                          <span style={{
+                            fontWeight: 700,
+                            fontSize: "0.72rem",
+                            color: vConfig.color,
+                            background: vConfig.badgeBg,
+                            padding: "3px 8px",
+                            borderRadius: "4px",
+                            display: "inline-flex",
+                            alignItems: "center",
+                            gap: "5px",
+                            textTransform: "uppercase"
+                          }}>
+                            <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: vConfig.dotColor, boxShadow: `0 0 6px ${vConfig.glow}` }}></span>
+                            {vConfig.label}
+                          </span>
+                          {alert.is_resolved && (
+                            <span style={{
+                              color: "var(--success)",
+                              fontSize: "0.65rem",
+                              fontWeight: 600,
+                              background: "rgba(16, 185, 129, 0.12)",
+                              padding: "2px 6px",
+                              borderRadius: "4px"
+                            }}>
+                              Resolved
+                            </span>
+                          )}
+                        </div>
                         <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>
                           {formatDateTime(alert.timestamp || alert.created_at)}
                         </span>
@@ -2142,24 +2354,45 @@ export default function ProjectView() {
                           {alert.threat_description.includes("[Not Gemini Verified]") ? "Model Conf:" : "Gemini Conf:"} <strong style={{ color: "var(--primary)" }}>{(alert.confidence_score * 100).toFixed(0)}%</strong>
                         </span>
                         <div style={{ display: "flex", gap: "8px" }}>
-                          {!alert.is_resolved && (
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleResolveAlert(alert.id);
-                              }}
-                              className="btn-primary"
-                              style={{
-                                padding: "4px 10px",
-                                fontSize: "0.7rem",
-                                borderRadius: "6px",
-                                background: "var(--success)",
-                                boxShadow: "none"
-                              }}
-                            >
-                              Resolve Alert
-                            </button>
-                          )}
+                          {(() => {
+                            const isViewed = Boolean(alert.is_resolved);
+                            return (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedEvidenceAlert(alert);
+                                  if (!alert.is_resolved) {
+                                    handleResolveAlert(alert.id);
+                                  }
+                                }}
+                                style={{
+                                  color: isViewed ? "#10b981" : "#ffffff",
+                                  fontWeight: 700,
+                                  fontSize: "0.7rem",
+                                  padding: "4px 10px",
+                                  background: isViewed ? "rgba(16, 185, 129, 0.15)" : "#ef4444",
+                                  border: `1px solid ${isViewed ? "rgba(16, 185, 129, 0.4)" : "#dc2626"}`,
+                                  boxShadow: isViewed ? "0 0 8px rgba(16, 185, 129, 0.2)" : "0 0 8px rgba(239, 68, 68, 0.4)",
+                                  borderRadius: "6px",
+                                  cursor: "pointer",
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "5px",
+                                  transition: "all 0.2s ease"
+                                }}
+                                title={isViewed ? "Seen / Inspected Notification" : "Unseen Notification - Click to Inspect"}
+                              >
+                                <span style={{
+                                  width: "5px",
+                                  height: "5px",
+                                  borderRadius: "50%",
+                                  background: isViewed ? "#10b981" : "#ffffff",
+                                  boxShadow: `0 0 4px ${isViewed ? "#10b981" : "#ffffff"}`
+                                }}></span>
+                                {isViewed ? "Inspect ✓" : "Inspect →"}
+                              </button>
+                            );
+                          })()}
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
@@ -2572,24 +2805,49 @@ export default function ProjectView() {
             onClick={(e) => e.stopPropagation()}
           >
             {/* Header */}
-            <div style={{
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              padding: "20px 24px",
-              borderBottom: "1px solid var(--border-glass)"
-            }}>
-              <h2 style={{ fontSize: "1.1rem", fontWeight: 800, display: "flex", alignItems: "center", gap: "10px", color: "var(--danger)" }}>
-                <ShieldAlert size={20} />
-                SURVEILLANCE EVIDENCE AUDIT REPORT
-              </h2>
-              <button 
-                onClick={() => setSelectedEvidenceAlert(null)} 
-                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", display: "flex", alignItems: "center" }}
-              >
-                <X size={20} />
-              </button>
-            </div>
+            {(() => {
+              const vConfig = getViolenceConfig(getViolenceLevel(selectedEvidenceAlert));
+              return (
+                <div style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  padding: "20px 24px",
+                  borderBottom: "1px solid var(--border-glass)",
+                  borderLeft: `5px solid ${vConfig.color}`,
+                  background: vConfig.bg
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+                    <h2 style={{ fontSize: "1.1rem", fontWeight: 800, display: "flex", alignItems: "center", gap: "10px", color: vConfig.color, margin: 0 }}>
+                      <ShieldAlert size={20} />
+                      SURVEILLANCE EVIDENCE AUDIT REPORT
+                    </h2>
+                    <span style={{
+                      color: vConfig.color,
+                      fontSize: "0.7rem",
+                      fontWeight: 700,
+                      background: vConfig.badgeBg,
+                      border: `1px solid ${vConfig.border}`,
+                      padding: "3px 8px",
+                      borderRadius: "4px",
+                      textTransform: "uppercase",
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "5px"
+                    }}>
+                      <span style={{ width: "6px", height: "6px", borderRadius: "50%", background: vConfig.dotColor, boxShadow: `0 0 6px ${vConfig.glow}` }}></span>
+                      {vConfig.label}
+                    </span>
+                  </div>
+                  <button 
+                    onClick={() => setSelectedEvidenceAlert(null)} 
+                    style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", display: "flex", alignItems: "center" }}
+                  >
+                    <X size={20} />
+                  </button>
+                </div>
+              );
+            })()}
 
             {/* Split layout: Snapshot & Metadata details */}
             <div style={{ display: "flex", flex: 1, minHeight: "450px" }}>

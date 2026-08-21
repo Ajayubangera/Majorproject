@@ -42,17 +42,23 @@ else:
             "timeout": 30.0  # Allow 30 seconds for Neon database connection wake-up
         }
 
-# Create engine — tuned for Neon serverless PostgreSQL which aggressively closes idle connections
+# Create engine — tuned for high performance with Supabase / PostgreSQL / SQLite
 is_postgres = "postgresql" in DATABASE_URL
+if is_postgres:
+    connect_args["server_settings"] = {
+        "application_name": "surveillance_backend",
+        "jit": "off"  # Disabling JIT prevents query plan compilation lag on simple queries
+    }
+
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     future=True,
-    pool_pre_ping=True,
-    pool_recycle=60 if is_postgres else 300,
-    pool_size=10 if is_postgres else 5,
-    max_overflow=20 if is_postgres else 10,
-    pool_timeout=30 if is_postgres else 10,  # Allow 30 seconds for pool checkout during cold starts
+    pool_pre_ping=is_postgres,  # True for PostgreSQL to prevent stale connection errors; False for SQLite
+    pool_recycle=600,
+    pool_size=20 if is_postgres else 5,
+    max_overflow=30 if is_postgres else 10,
+    pool_timeout=15 if is_postgres else 10,
     connect_args=connect_args
 )
 
@@ -81,7 +87,7 @@ class Project(Base):
     name = Column(String(255), nullable=False)
     location = Column(Text, nullable=False)
     project_type = Column(String(50), nullable=False)
-    owner_id = Column(String(255), nullable=False) # Store user email or sub id
+    owner_id = Column(String(255), nullable=False, index=True) # Store user email or sub id
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     __table_args__ = (
@@ -96,8 +102,8 @@ class Project(Base):
 class ProjectMember(Base):
     __tablename__ = "project_members"
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
-    email = Column(String(255), nullable=False)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    email = Column(String(255), nullable=False, index=True)
     role = Column(String(50), nullable=False)
     joined_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -111,7 +117,7 @@ class ProjectMember(Base):
 class Camera(Base):
     __tablename__ = "cameras"
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(255), nullable=False)
     source_type = Column(String(50), nullable=False)
     nvr_ip_address = Column(String(100), nullable=True)
@@ -131,16 +137,16 @@ class Camera(Base):
 class Alert(Base):
     __tablename__ = "alerts"
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
-    camera_id = Column(String(36), ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    camera_id = Column(String(36), ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False, index=True)
     snapshot_url = Column(Text, nullable=False)
     threat_description = Column(Text, nullable=False)
     confidence_score = Column(Float, nullable=False)
     anomaly_type = Column(String(50), nullable=True)  # running, loitering, fighting, phone_use
-    is_resolved = Column(Boolean, default=False)
-    is_trashed = Column(Boolean, default=False)
-    is_new = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    is_resolved = Column(Boolean, default=False, index=True)
+    is_trashed = Column(Boolean, default=False, index=True)
+    is_new = Column(Boolean, default=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
     project = relationship("Project", back_populates="alerts")
     camera = relationship("Camera", back_populates="alerts")
@@ -154,24 +160,54 @@ async def init_db():
             await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp";'))
         await conn.run_sync(Base.metadata.create_all)
         
-        # Safe schema migration for is_trashed and is_new columns using SQLAlchemy inspector
+        # Fast Index and Schema Optimization
         try:
             from sqlalchemy import inspect, text
-            def check_and_add_columns(sync_conn):
+            def check_and_add_indexes_columns(sync_conn):
                 inspector = inspect(sync_conn)
-                columns = [col['name'] for col in inspector.get_columns('alerts')]
-                if 'is_trashed' not in columns:
-                    sync_conn.execute(text("ALTER TABLE alerts ADD COLUMN is_trashed BOOLEAN DEFAULT FALSE;"))
-                    print("Migration: Added is_trashed column to alerts table successfully.")
-                if 'is_new' not in columns:
-                    sync_conn.execute(text("ALTER TABLE alerts ADD COLUMN is_new BOOLEAN DEFAULT TRUE;"))
-                    print("Migration: Added is_new column to alerts table successfully.")
-                if 'anomaly_type' not in columns:
-                    sync_conn.execute(text("ALTER TABLE alerts ADD COLUMN anomaly_type VARCHAR(50);"))
-                    print("Migration: Added anomaly_type column to alerts table successfully.")
-            await conn.run_sync(check_and_add_columns)
+                tables = inspector.get_table_names()
+                
+                if 'alerts' in tables:
+                    columns = [col['name'] for col in inspector.get_columns('alerts')]
+                    if 'is_trashed' not in columns:
+                        sync_conn.execute(text("ALTER TABLE alerts ADD COLUMN is_trashed BOOLEAN DEFAULT FALSE;"))
+                    if 'is_new' not in columns:
+                        sync_conn.execute(text("ALTER TABLE alerts ADD COLUMN is_new BOOLEAN DEFAULT TRUE;"))
+                    if 'anomaly_type' not in columns:
+                        sync_conn.execute(text("ALTER TABLE alerts ADD COLUMN anomaly_type VARCHAR(50);"))
+
+                # Create performance indexes
+                index_sqls = [
+                    "CREATE INDEX IF NOT EXISTS idx_projects_owner_id ON projects (owner_id);",
+                    "CREATE INDEX IF NOT EXISTS idx_project_members_email ON project_members (email);",
+                    "CREATE INDEX IF NOT EXISTS idx_project_members_project_id ON project_members (project_id);",
+                    "CREATE INDEX IF NOT EXISTS idx_cameras_project_id ON cameras (project_id);",
+                    "CREATE INDEX IF NOT EXISTS idx_alerts_project_id ON alerts (project_id);",
+                    "CREATE INDEX IF NOT EXISTS idx_alerts_camera_id ON alerts (camera_id);",
+                    "CREATE INDEX IF NOT EXISTS idx_alerts_is_trashed_new ON alerts (project_id, is_trashed, is_new);",
+                    "CREATE INDEX IF NOT EXISTS idx_alerts_proj_trashed_created ON alerts (project_id, is_trashed, created_at DESC);",
+                    "CREATE INDEX IF NOT EXISTS idx_alerts_proj_resolved ON alerts (project_id, is_resolved);",
+                    "CREATE INDEX IF NOT EXISTS idx_alerts_created_at ON alerts (created_at DESC);"
+                ]
+                for idx_sql in index_sqls:
+                    try:
+                        sync_conn.execute(text(idx_sql))
+                    except Exception:
+                        pass
+
+            await conn.run_sync(check_and_add_indexes_columns)
         except Exception as e:
-            print(f"Migration warning: Could not verify/alter alerts table: {e}")
+            print(f"Migration warning: {e}")
+
+# Pre-warm connection pool on startup
+async def warmup_db():
+    try:
+        from sqlalchemy import text
+        async with AsyncSessionLocal() as session:
+            await session.execute(text("SELECT 1;"))
+        print("[Database] Connection pool successfully warmed up.")
+    except Exception as e:
+        print(f"[Database] Warmup notice: {e}")
 
 # Session dependency — with resilient error handling for serverless DB connections
 async def get_db():

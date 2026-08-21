@@ -325,7 +325,7 @@ class CameraStreamWorker:
                 else:
                     cap = cv2.VideoCapture(cap_source)
 
-                if not cap.isOpened():
+                if not cap or not cap.isOpened():
                     delay = self._get_reconnect_delay()
                     print(f"[StreamManager] Camera '{self.camera_name}': Failed to open stream, retrying in {delay}s (attempt {self._reconnect_count})...")
                     self._is_connected = False
@@ -336,50 +336,57 @@ class CameraStreamWorker:
                 self._is_connected = True
                 self._reset_reconnect()
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                print(f"[StreamManager] Camera '{self.camera_name}': OpenCV stream connected with buffer size 1.")
+                print(f"[StreamManager] Camera '{self.camera_name}': OpenCV stream connected.")
 
-                if not is_usb:
-                    # Frame grabber loop to empty the buffer in a background thread.
-                    # Spawn only for network RTSP/FFmpeg streams to prevent buffering latency.
-                    def grabber_loop():
-                        while self._running and grabber_state["running"]:
-                            ret, frame = cap.read()
-                            if not ret or frame is None:
-                                with grabber_lock:
-                                    grabber_state["ret"] = False
-                                    grabber_state["frame"] = None
-                                break
+                # Frame grabber loop to empty the buffer in a background thread.
+                # Used for ALL stream types (RTSP and USB) to prevent cap.read() blocking the display loop.
+                def grabber_loop():
+                    while self._running and grabber_state["running"]:
+                        ret, frame = cap.read()
+                        if not ret or frame is None:
                             with grabber_lock:
-                                grabber_state["ret"] = True
-                                grabber_state["frame"] = frame
+                                grabber_state["ret"] = False
+                                grabber_state["frame"] = None
+                            if is_usb:
+                                # USB disconnections are immediate, break to trigger reconnect
+                                break
+                            else:
+                                break
+                        with grabber_lock:
+                            grabber_state["ret"] = True
+                            grabber_state["frame"] = frame
+                        time.sleep(0.001)
 
-                    grabber_thread = threading.Thread(target=grabber_loop, daemon=True)
-                    grabber_thread.start()
+                grabber_thread = threading.Thread(target=grabber_loop, daemon=True)
+                grabber_thread.start()
 
                 frame_interval = 1.0 / STREAM_FPS
+                last_frame_time = time.time()
 
                 while self._running:
                     start_time = time.time()
                     
-                    if is_usb:
-                        # For USB, read directly in the main thread (DirectShow handles buffering cleanly)
-                        ret, frame = cap.read()
-                    else:
-                        with grabber_lock:
-                            ret = grabber_state["ret"]
-                            frame = grabber_state["frame"]
+                    if not grabber_thread.is_alive():
+                        print(f"[StreamManager] Camera '{self.camera_name}': CV grabber thread disconnected.")
+                        self._is_connected = False
+                        break
+
+                    with grabber_lock:
+                        ret = grabber_state["ret"]
+                        frame = grabber_state["frame"]
 
                     if not ret or frame is None:
-                        # Reconnect if grabber thread died (RTSP) or if USB read failed
-                        if is_usb or (not grabber_thread.is_alive()):
-                            print(f"[StreamManager] Camera '{self.camera_name}': Connection lost or read failed, reconnecting...")
+                        if time.time() - last_frame_time > 3.0:
+                            print(f"[StreamManager] Camera '{self.camera_name}': Connection lost or read stalled, reconnecting...")
                             self._is_connected = False
                             break
                         time.sleep(0.01)
                         continue
 
+                    last_frame_time = time.time()
                     self._is_connected = True
-                    # Store raw frame for inference (single copy, not two)
+
+                    # Store raw frame for inference
                     raw_copy = frame.copy()
                     with self._lock:
                         self._latest_raw_frame = raw_copy
@@ -388,22 +395,19 @@ class CameraStreamWorker:
                     with self._inference_lock:
                         current_detections = self._latest_detections
 
-                    # Only draw annotations if there are active detections (skip overhead otherwise)
+                    # Only draw annotations if there are active detections
                     if current_detections and self.tracker:
                         annotated_frame = self.tracker.draw_annotations(frame, current_detections)
                     else:
                         annotated_frame = frame
 
-                    # Encode for display stream (720p, quality 65 — fast) not full-res
                     jpeg_bytes = encode_stream_jpeg(annotated_frame)
                     self._set_frame(jpeg_bytes, raw_copy)
 
-                    # Throttle to target FPS (skip sleep for USB webcams as cap.read() blocks naturally to regulate rate)
-                    if not is_usb:
-                        elapsed = time.time() - start_time
-                        sleep_time = frame_interval - elapsed
-                        if sleep_time > 0:
-                            time.sleep(sleep_time)
+                    elapsed = time.time() - start_time
+                    sleep_time = frame_interval - elapsed
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
 
             except Exception as e:
                 print(f"[StreamManager] Camera '{self.camera_name}': CV stream error: {e}")
@@ -428,12 +432,16 @@ class CameraStreamWorker:
         Reconnects with exponential backoff (0.5s → 1s → 2s capped).
         """
         import requests
-        last_inference_time = 0
 
         while self._running:
+            response = None
+            grabber_thread = None
+            grabber_state = {"running": True, "jpeg_data": None}
+            grabber_lock = threading.Lock()
+
             try:
-                print(f"[StreamManager] Camera '{self.camera_name}': Connecting to MJPEG stream...")
-                response = requests.get(self.rtsp_url, stream=True, timeout=5)
+                print(f"[StreamManager] Camera '{self.camera_name}': Connecting to MJPEG stream ({self.rtsp_url})...")
+                response = requests.get(self.rtsp_url, stream=True, timeout=(2.5, 2.5))
 
                 if response.status_code != 200:
                     delay = self._get_reconnect_delay()
@@ -443,78 +451,108 @@ class CameraStreamWorker:
                     time.sleep(delay)
                     continue
 
-                content_type = response.headers.get("content-type", "")
+                content_type = response.headers.get("content-type", "").lower()
                 self._is_connected = True
                 self._reset_reconnect()
-                print(f"[StreamManager] Camera '{self.camera_name}': MJPEG stream connected.")
+                print(f"[StreamManager] Camera '{self.camera_name}': MJPEG stream connected successfully.")
 
                 if "multipart" in content_type:
-                    # MJPEG multipart stream
-                    grabber_state = {"running": True, "jpeg_data": None}
-                    grabber_lock = threading.Lock()
+                    # Set socket timeout on the raw underlying socket if accessible
+                    try:
+                        if hasattr(response, "raw") and hasattr(response.raw, "_fp") and response.raw._fp is not None:
+                            sock = getattr(response.raw._fp, "fp", None)
+                            if sock and hasattr(sock, "raw") and hasattr(sock.raw, "_sock"):
+                                sock.raw._sock.settimeout(2.5)
+                    except Exception:
+                        pass
 
-                    # Grabber thread does simple parsing of raw JPEG bytes WITHOUT decoding.
-                    # This runs fast enough (microseconds) to prevent TCP socket buffer lag build-up.
+                    grabber_state["last_chunk_time"] = time.time()
+
+                    # MJPEG multipart stream
                     def mjpeg_grabber():
                         buffer = b""
                         try:
                             for chunk in response.iter_content(chunk_size=4096):
                                 if not self._running or not grabber_state["running"]:
                                     break
+                                if not chunk:
+                                    continue
                                 buffer += chunk
+
+                                with grabber_lock:
+                                    grabber_state["last_chunk_time"] = time.time()
 
                                 while True:
                                     start = buffer.find(b"\xff\xd8")
                                     if start == -1:
+                                        if len(buffer) > 2:
+                                            buffer = buffer[-2:]
                                         break
-                                    end = buffer.find(b"\xff\xd9", start)
+                                    if start > 0:
+                                        buffer = buffer[start:]
+                                        start = 0
+
+                                    end = buffer.find(b"\xff\xd9", 2)
                                     if end == -1:
+                                        if len(buffer) > 2 * 1024 * 1024:
+                                            buffer = b""
                                         break
 
-                                    # Extract JPEG frame
-                                    jpeg_data = buffer[start:end + 2]
+                                    jpeg_data = buffer[:end + 2]
                                     buffer = buffer[end + 2:]
 
                                     with grabber_lock:
                                         grabber_state["jpeg_data"] = jpeg_data
-
-                                    # Cap buffer size
-                                    if len(buffer) > 1 * 1024 * 1024:
-                                        buffer = buffer[-256 * 1024:]
                         except Exception as e:
-                            print(f"[StreamManager] Camera '{self.camera_name}' MJPEG grabber error: {e}")
+                            print(f"[StreamManager] Camera '{self.camera_name}' MJPEG grabber disconnected: {e}")
+                        finally:
+                            with grabber_lock:
+                                grabber_state["running"] = False
 
                     grabber_thread = threading.Thread(target=mjpeg_grabber, daemon=True)
                     grabber_thread.start()
 
                     frame_interval = 1.0 / STREAM_FPS
-
                     last_jpeg_data = None
+                    last_frame_arrival_time = time.time()
+
                     while self._running:
                         start_time = time.time()
-                        
+
+                        # Immediate check if grabber thread stopped/disconnected
+                        if not grabber_thread.is_alive():
+                            print(f"[StreamManager] Camera '{self.camera_name}': MJPEG grabber thread disconnected.")
+                            self._is_connected = False
+                            break
+
                         jpeg_data = None
                         with grabber_lock:
                             jpeg_data = grabber_state["jpeg_data"]
 
                         if jpeg_data is None:
-                            if not grabber_thread.is_alive():
-                                print(f"[StreamManager] Camera '{self.camera_name}': MJPEG grabber thread died.")
+                            if time.time() - last_frame_arrival_time > 3.0:
+                                print(f"[StreamManager] Camera '{self.camera_name}': MJPEG initial frame timeout, reconnecting...")
+                                self._is_connected = False
                                 break
                             time.sleep(0.01)
                             continue
 
-                        # Optimize CPU: only process when a truly new frame arrives from the network socket
+                        # Frame change detection
                         if jpeg_data is last_jpeg_data:
+                            if time.time() - last_frame_arrival_time > 3.0:
+                                print(f"[StreamManager] Camera '{self.camera_name}': MJPEG stream stalled (no new frames for 3s), reconnecting...")
+                                self._is_connected = False
+                                break
                             time.sleep(0.002)
                             continue
+
+                        last_frame_arrival_time = time.time()
                         last_jpeg_data = jpeg_data
 
                         with self._inference_lock:
                             current_detections = self._latest_detections
 
-                        # Always decode, annotate, and compress to lightweight 720p/50 quality display frame
-                        # This avoids saturating the network with huge 500KB raw frames from mobile/IP cameras
+                        # Decode and annotate frame
                         nparr = np.frombuffer(jpeg_data, np.uint8)
                         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
@@ -537,8 +575,6 @@ class CameraStreamWorker:
                         if sleep_time > 0:
                             time.sleep(sleep_time)
 
-                    grabber_state["running"] = False
-                    grabber_thread.join(timeout=1.0)
                 else:
                     # Single JPEG snapshot endpoint — poll it
                     frame_interval = 1.0 / STREAM_FPS
@@ -566,11 +602,11 @@ class CameraStreamWorker:
                                     else:
                                         annotated_frame = frame
 
-                                    # Encode and store annotated frame (keeping original native resolution)
-                                    jpeg_bytes = encode_jpeg(annotated_frame, JPEG_QUALITY)
-                                    self._set_frame(jpeg_bytes)
+                                    jpeg_bytes = encode_stream_jpeg(annotated_frame)
+                                    self._set_frame(jpeg_bytes, frame)
                             else:
                                 self._is_connected = False
+                                break
                         except Exception:
                             self._is_connected = False
                             break
@@ -584,12 +620,19 @@ class CameraStreamWorker:
                 print(f"[StreamManager] Camera '{self.camera_name}': MJPEG stream error: {e}")
                 self._is_connected = False
             finally:
-                pass
+                grabber_state["running"] = False
+                if response is not None:
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                if grabber_thread:
+                    grabber_thread.join(timeout=1.0)
 
             if self._running:
                 self._set_frame(encode_jpeg(generate_no_signal_frame()))
                 delay = self._get_reconnect_delay()
-                print(f"[StreamManager] Camera '{self.camera_name}': MJPEG stream lost, reconnecting in {delay}s (attempt {self._reconnect_count})...")
+                print(f"[StreamManager] Camera '{self.camera_name}': Stream disconnected, auto-reconnecting in {delay}s (attempt {self._reconnect_count})...")
                 time.sleep(delay)
 
     def _handle_anomaly(self, original_frame: np.ndarray, anomalies: list):

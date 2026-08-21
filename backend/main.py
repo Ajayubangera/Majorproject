@@ -17,11 +17,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, update
+from sqlalchemy import func, update, text
 from jose import JWTError, jwt
 import bcrypt
 
-from database import init_db, get_db, AsyncSessionLocal, User, Project, ProjectMember, Camera, Alert
+from database import init_db, warmup_db, get_db, AsyncSessionLocal, User, Project, ProjectMember, Camera, Alert, is_postgres
 from stream_manager import StreamManager, encode_jpeg, generate_no_signal_frame
 
 # Create backend directories
@@ -158,6 +158,7 @@ async def initialize_stream_workers():
 @app.on_event("startup")
 async def startup_event():
     await init_db()
+    await warmup_db()
     # Store reference to the running event loop for cross-thread scheduling
     import builtins
     builtins._main_event_loop = asyncio.get_event_loop()
@@ -340,48 +341,48 @@ async def login(user_data: UserLogin, db: AsyncSession = Depends(get_db)):
 
 @app.get("/api/projects")
 async def list_projects(email: str, db: AsyncSession = Depends(get_db)):
-    # Return projects owned by user or where user is member
-    result = await db.execute(select(Project).where(Project.owner_id == email))
-    owned_projects = result.scalars().all()
+    # Optimized single-query project listing with camera and active unread alert count aggregation
+    stmt = text("""
+        SELECT 
+            p.id,
+            p.name,
+            p.location,
+            p.project_type,
+            p.owner_id,
+            p.created_at,
+            COALESCE(c.cam_count, 0) as cameras_count,
+            COALESCE(a.alert_count, 0) as alerts_count
+        FROM projects p
+        LEFT JOIN (
+            SELECT project_id, COUNT(id) as cam_count 
+            FROM cameras 
+            GROUP BY project_id
+        ) c ON p.id = c.project_id
+        LEFT JOIN (
+            SELECT project_id, COUNT(id) as alert_count 
+            FROM alerts 
+            WHERE is_trashed = FALSE AND is_new = TRUE
+            GROUP BY project_id
+        ) a ON p.id = a.project_id
+        WHERE p.owner_id = :email 
+           OR p.id IN (SELECT project_id FROM project_members WHERE email = :email)
+        ORDER BY p.created_at DESC;
+    """)
+    result = await db.execute(stmt, {"email": email})
+    rows = result.mappings().all()
     
-    member_result = await db.execute(select(ProjectMember).where(ProjectMember.email == email))
-    member_records = member_result.scalars().all()
-    
-    project_ids = [m.project_id for m in member_records]
-    joined_projects = []
-    if project_ids:
-        joined_result = await db.execute(select(Project).where(Project.id.in_(project_ids)))
-        joined_projects = joined_result.scalars().all()
-        
-    # Merge and build response
     projects_list = []
-    seen = set()
-    for p in (owned_projects + joined_projects):
-        if p.id not in seen:
-            seen.add(p.id)
-            # Count cameras and alerts today
-            c_count = await db.execute(select(func.count(Camera.id)).where(Camera.project_id == p.id))
-            cameras_total = c_count.scalar() or 0
-            
-            a_count = await db.execute(
-                select(func.count(Alert.id))
-                .where(Alert.project_id == p.id)
-                .where(Alert.is_trashed == False)
-                .where(Alert.is_new == True)
-            )
-            alerts_total = a_count.scalar() or 0
-            
-            projects_list.append({
-                "id": p.id,
-                "name": p.name,
-                "location": p.location,
-                "project_type": p.project_type,
-                "owner_id": p.owner_id,
-                "created_at": p.created_at,
-                "cameras_count": cameras_total,
-                "alerts_count": alerts_total
-            })
-            
+    for r in rows:
+        projects_list.append({
+            "id": r["id"],
+            "name": r["name"],
+            "location": r["location"],
+            "project_type": r["project_type"],
+            "owner_id": r["owner_id"],
+            "created_at": r["created_at"],
+            "cameras_count": int(r["cameras_count"]),
+            "alerts_count": int(r["alerts_count"])
+        })
     return projects_list
 
 @app.post("/api/projects")
@@ -409,53 +410,141 @@ async def create_project(project_data: ProjectCreate, email: str, db: AsyncSessi
 
 @app.get("/api/projects/{project_id}")
 async def get_project_details(project_id: str, db: AsyncSession = Depends(get_db)):
-    project_result = await db.execute(select(Project).where(Project.id == project_id))
-    project = project_result.scalars().first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
+    if is_postgres:
+        # High-speed single round-trip query for PostgreSQL / Supabase
+        single_sql = text("""
+            SELECT 
+                p.id, p.name, p.location, p.project_type, p.owner_id, p.created_at,
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                        'id', c.id,
+                        'name', c.name,
+                        'source_type', c.source_type,
+                        'rtsp_url', c.rtsp_url,
+                        'zone_tag', c.zone_tag,
+                        'ai_active', c.ai_active,
+                        'nvr_ip_address', c.nvr_ip_address,
+                        'channel_number', c.channel_number
+                    ))
+                    FROM cameras c
+                    WHERE c.project_id = p.id
+                ), '[]'::json) AS cameras,
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                        'id', m.id,
+                        'email', m.email,
+                        'role', m.role
+                    ))
+                    FROM project_members m
+                    WHERE m.project_id = p.id
+                ), '[]'::json) AS members,
+                COALESCE((
+                    SELECT json_agg(json_build_object(
+                        'id', a.id,
+                        'camera_id', a.camera_id,
+                        'camera_name', cam.name,
+                        'zone_tag', cam.zone_tag,
+                        'snapshot_url', a.snapshot_url,
+                        'threat_description', a.threat_description,
+                        'confidence_score', a.confidence_score,
+                        'anomaly_type', a.anomaly_type,
+                        'is_resolved', a.is_resolved,
+                        'is_trashed', a.is_trashed,
+                        'is_new', a.is_new,
+                        'created_at', to_char(a.created_at, 'YYYY-MM-DD HH24:MI:SS')
+                    ) ORDER BY a.created_at DESC)
+                    FROM alerts a
+                    LEFT JOIN cameras cam ON a.camera_id = cam.id
+                    WHERE a.project_id = p.id
+                ), '[]'::json) AS alerts
+            FROM projects p
+            WHERE p.id = :project_id;
+        """)
+        res = await db.execute(single_sql, {"project_id": project_id})
+        row = res.mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Project not found")
+            
+        cams = json.loads(row["cameras"]) if isinstance(row["cameras"], str) else (row["cameras"] or [])
+        members = json.loads(row["members"]) if isinstance(row["members"], str) else (row["members"] or [])
+        alerts = json.loads(row["alerts"]) if isinstance(row["alerts"], str) else (row["alerts"] or [])
         
+        return {
+            "project": {
+                "id": row["id"],
+                "name": row["name"],
+                "location": row["location"],
+                "project_type": row["project_type"],
+                "owner_id": row["owner_id"],
+                "created_at": row["created_at"]
+            },
+            "cameras": cams,
+            "members": members,
+            "alerts": alerts
+        }
+    else:
+        # SQLite / Generic Fallback
+        project_result = await db.execute(select(Project).where(Project.id == project_id))
+        project = project_result.scalars().first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+            
+        cameras_result = await db.execute(select(Camera).where(Camera.project_id == project_id))
+        cameras = cameras_result.scalars().all()
+        
+        members_result = await db.execute(select(ProjectMember).where(ProjectMember.project_id == project_id))
+        members = members_result.scalars().all()
+        
+        alerts_result = await db.execute(
+            select(Alert, Camera.name, Camera.zone_tag)
+            .join(Camera, Alert.camera_id == Camera.id)
+            .where(Alert.project_id == project_id)
+            .order_by(Alert.created_at.desc())
+        )
+        alerts = alerts_result.all()
+        
+        alerts_list = []
+        for alert, camera_name, zone_tag in alerts:
+            alerts_list.append({
+                "id": alert.id,
+                "camera_id": alert.camera_id,
+                "camera_name": camera_name,
+                "zone_tag": zone_tag,
+                "snapshot_url": alert.snapshot_url,
+                "threat_description": alert.threat_description,
+                "confidence_score": alert.confidence_score,
+                "anomaly_type": alert.anomaly_type,
+                "is_resolved": alert.is_resolved,
+                "is_trashed": alert.is_trashed,
+                "is_new": alert.is_new,
+                "created_at": alert.created_at.strftime("%Y-%m-%d %H:%M:%S") if alert.created_at else None
+            })
+            
+        return {
+            "project": {
+                "id": project.id,
+                "name": project.name,
+                "location": project.location,
+                "project_type": project.project_type,
+                "owner_id": project.owner_id,
+                "created_at": project.created_at
+            },
+            "cameras": [{"id": c.id, "name": c.name, "source_type": c.source_type, "rtsp_url": c.rtsp_url, "zone_tag": c.zone_tag, "ai_active": c.ai_active, "nvr_ip_address": c.nvr_ip_address, "channel_number": c.channel_number} for c in cameras],
+            "members": [{"id": m.id, "email": m.email, "role": m.role} for m in members],
+            "alerts": alerts_list
+        }
+
+@app.get("/api/projects/{project_id}/cameras")
+async def get_project_cameras(project_id: str, db: AsyncSession = Depends(get_db)):
     cameras_result = await db.execute(select(Camera).where(Camera.project_id == project_id))
     cameras = cameras_result.scalars().all()
-    
+    return [{"id": c.id, "name": c.name, "source_type": c.source_type, "rtsp_url": c.rtsp_url, "zone_tag": c.zone_tag, "ai_active": c.ai_active, "nvr_ip_address": c.nvr_ip_address, "channel_number": c.channel_number} for c in cameras]
+
+@app.get("/api/projects/{project_id}/members")
+async def get_project_members(project_id: str, db: AsyncSession = Depends(get_db)):
     members_result = await db.execute(select(ProjectMember).where(ProjectMember.project_id == project_id))
     members = members_result.scalars().all()
-    
-    alerts_result = await db.execute(
-        select(Alert, Camera.name, Camera.zone_tag)
-        .join(Camera, Alert.camera_id == Camera.id)
-        .where(Alert.project_id == project_id)
-        .order_by(Alert.created_at.desc())
-    )
-    alerts = alerts_result.all()
-    
-    alerts_list = []
-    for alert, camera_name, zone_tag in alerts:
-        alerts_list.append({
-            "id": alert.id,
-            "camera_id": alert.camera_id,
-            "camera_name": camera_name,
-            "zone_tag": zone_tag,
-            "snapshot_url": alert.snapshot_url,
-            "threat_description": alert.threat_description,
-            "confidence_score": alert.confidence_score,
-            "is_resolved": alert.is_resolved,
-            "is_trashed": alert.is_trashed,
-            "created_at": alert.created_at.strftime("%Y-%m-%d %H:%M:%S") if alert.created_at else None
-        })
-        
-    return {
-        "project": {
-            "id": project.id,
-            "name": project.name,
-            "location": project.location,
-            "project_type": project.project_type,
-            "owner_id": project.owner_id,
-            "created_at": project.created_at
-        },
-        "cameras": [{"id": c.id, "name": c.name, "source_type": c.source_type, "rtsp_url": c.rtsp_url, "zone_tag": c.zone_tag, "ai_active": c.ai_active, "nvr_ip_address": c.nvr_ip_address, "channel_number": c.channel_number} for c in cameras],
-        "members": [{"id": m.id, "email": m.email, "role": m.role} for m in members],
-        "alerts": alerts_list
-    }
+    return [{"id": m.id, "email": m.email, "role": m.role, "joined_at": m.joined_at.strftime("%Y-%m-%d") if m.joined_at else None} for m in members]
 
 @app.post("/api/projects/{project_id}/members")
 async def add_project_member(project_id: str, invite: ProjectMemberInvite, db: AsyncSession = Depends(get_db)):
@@ -472,7 +561,18 @@ async def add_project_member(project_id: str, invite: ProjectMemberInvite, db: A
     )
     db.add(new_member)
     await db.commit()
-    return {"message": "Member invited successfully", "member": {"email": invite.email, "role": invite.role}}
+    await db.refresh(new_member)
+    return {"message": "Member added successfully", "member": {"id": new_member.id, "email": new_member.email, "role": new_member.role}}
+
+@app.delete("/api/projects/{project_id}/members/{member_id}")
+async def delete_project_member(project_id: str, member_id: str, db: AsyncSession = Depends(get_db)):
+    member_res = await db.execute(select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.id == member_id))
+    member = member_res.scalars().first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+    await db.delete(member)
+    await db.commit()
+    return {"message": "Member access removed successfully"}
 
 @app.post("/api/projects/{project_id}/cameras")
 async def create_camera(project_id: str, camera_data: CameraCreate, db: AsyncSession = Depends(get_db)):
@@ -801,7 +901,7 @@ async def get_project_alerts(project_id: str, db: AsyncSession = Depends(get_db)
             "is_resolved": alert.is_resolved,
             "is_trashed": alert.is_trashed,
             "is_new": alert.is_new,
-            "created_at": alert.created_at.strftime("%Y-%m-%d %H:%M:%S") if alert.created_at else None
+            "created_at": alert.created_at.strftime("%Y-%m-%dT%H:%M:%SZ") if alert.created_at else None
         })
     return alerts_data
 
@@ -829,7 +929,7 @@ async def get_trashed_project_alerts(project_id: str, db: AsyncSession = Depends
             "is_resolved": alert.is_resolved,
             "is_trashed": alert.is_trashed,
             "is_new": alert.is_new,
-            "created_at": alert.created_at.strftime("%Y-%m-%d %H:%M:%S") if alert.created_at else None
+            "created_at": alert.created_at.strftime("%Y-%m-%dT%H:%M:%SZ") if alert.created_at else None
         })
     return alerts_data
 
@@ -940,7 +1040,7 @@ async def recover_alert(alert_id: str, db: AsyncSession = Depends(get_db)):
             "confidence_score": alert.confidence_score,
             "is_resolved": alert.is_resolved,
             "is_trashed": alert.is_trashed,
-            "created_at": alert.created_at.strftime("%Y-%m-%d %H:%M:%S") if alert.created_at else None
+            "created_at": alert.created_at.strftime("%Y-%m-%dT%H:%M:%SZ") if alert.created_at else None
         }
     })
     return {"message": "Alert recovered from trash", "alert": alert}
@@ -1014,7 +1114,7 @@ async def fetch_camera_snapshot(url: str) -> Optional[bytes]:
         print(f"Backend failed to fetch camera snapshot directly: {e}")
     return None
 
-# Background threat verification task using Gemini and committing to DB
+# Background threat verification task using LangChain (Gemini + OpenRouter fallback) and committing to DB
 async def verify_threat_in_background(
     camera_id: str, 
     project_id: str,
@@ -1025,101 +1125,158 @@ async def verify_threat_in_background(
     camera_name: str,
     camera_zone_tag: str
 ):
-    gemini_keys = [
-        os.getenv("GEMINI_API_KEY"),
-        os.getenv("GEMINI_API_KEY_1"),
-        os.getenv("GEMINI_API_KEY_2"),
-        os.getenv("GEMINI_API_KEY_3"),
-        os.getenv("GEMINI_API_KEY_4"),
-        os.getenv("GEMINI_API_KEY_5")
-    ]
-    gemini_keys = [k for k in gemini_keys if k]
-    
     threat_detected = False
     threat_description = "Normal monitoring environment."
     confidence_score = confidence_yolo
     verified_successfully = False
     
-    if gemini_keys and image_data:
-        # Loop through pool of keys in order
+    # ─── LangChain Threat Verification Pipeline ─────────────────────────────
+    # Strategy: Try Gemini keys via LangChain → OpenRouter fallback → Offline simulation
+    
+    if image_data:
+        import base64 as b64mod
+        image_b64 = b64mod.b64encode(image_data).decode("utf-8")
+        
+        # Build the threat verification prompt
+        if anomaly_type.lower() == "normal":
+            verification_prompt = (
+                "You are an AI Security Analytics Officer verifying potential surveillance threats.\n"
+                "Our edge YOLOv8 model flagged a potential event, but it has been classified as 'normal' behavior (false positive check).\n"
+                "Please analyze this frame and confirm that there is indeed NO active threat or anomaly.\n\n"
+                "Return a JSON object in this exact format:\n"
+                '{"threat_detected": false, "threat_description": "Normal activity verified in this scene.", "confidence": 0.95}\n'
+                "Return strictly valid raw JSON only. No markdown wrapping."
+            )
+        else:
+            verification_prompt = (
+                "You are an AI Security Analytics Officer verifying potential surveillance threats.\n"
+                f"Our edge YOLOv8 detection model has flagged a potential '{anomaly_type}' event in this camera frame.\n\n"
+                "Task:\n"
+                "1. Analyze the environment and contents shown in the camera frame.\n"
+                f"2. Determine if the '{anomaly_type}' threat is genuinely occurring (e.g. fire/smoke, fighting/physical violence, unauthorized entry/climbing, or lingering loitering behavior).\n"
+                f"3. If this is a simulated black or solid-colored test frame and YOLO confidence is high (>= 0.70), you may assume it is a simulated test threat event, write a realistic description of '{anomaly_type}' in the target environment, and mark threat_detected true.\n"
+                "4. Otherwise, if there is no genuine threat in the frame, mark threat_detected false and describe the normal activity.\n\n"
+                "Return a JSON object in this exact format:\n"
+                '{"threat_detected": true_or_false, "threat_description": "A detailed, genuine description of the verified threat or normal scene", "confidence": ' + str(confidence_yolo) + '}\n'
+                "Return strictly valid raw JSON only. No markdown wrapping."
+            )
+        
+        # ─── Strategy 1: LangChain with Gemini API keys ─────────────────────
+        gemini_keys = [
+            os.getenv("GEMINI_API_KEY"),
+            os.getenv("GEMINI_API_KEY_1"),
+            os.getenv("GEMINI_API_KEY_2"),
+            os.getenv("GEMINI_API_KEY_3"),
+            os.getenv("GEMINI_API_KEY_4"),
+            os.getenv("GEMINI_API_KEY_5")
+        ]
+        gemini_keys = [k for k in gemini_keys if k]
+        
         for idx, key in enumerate(gemini_keys):
             try:
-                from google import genai
-                from google.genai import types
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                from langchain_core.messages import HumanMessage
                 
-                print(f"[Gemini] Attempting threat verification with API Key #{idx}...")
-                client = genai.Client(api_key=key)
+                print(f"[LangChain-Gemini] Attempting threat verification with API Key #{idx}...")
                 
-                if anomaly_type.lower() == "normal":
-                    prompt = f"""
-                    You are an AI Security Analytics Officer verifying potential surveillance threats.
-                    Our edge YOLOv8 model flagged a potential event, but it has been classified as 'normal' behavior (false positive check).
-                    Please analyze this frame and confirm that there is indeed NO active threat or anomaly.
-                    
-                    Return a JSON object in this format:
-                    {{
-                       "threat_detected": false,
-                       "threat_description": "Normal activity verified in this scene.",
-                       "confidence": 0.95
-                    }}
-                    Do not wrap in markdown tags. Return strictly valid raw JSON.
-                    """
-                else:
-                    prompt = f"""
-                    You are an AI Security Analytics Officer verifying potential surveillance threats.
-                    Our edge YOLOv8 detection model has flagged a potential '{anomaly_type}' event in this camera frame.
-                    
-                    Task:
-                    1. Analyze the environment and contents shown in the camera frame.
-                    2. Determine if the '{anomaly_type}' threat is genuinely occurring (e.g. fire/smoke, fighting/physical violence, unauthorized entry/climbing, or lingering loitering behavior).
-                    3. If this is a simulated black or solid-colored test frame and YOLO confidence is high (>= 0.70), you may assume it is a simulated test threat event, write a realistic description of '{anomaly_type}' in the target environment, and mark "threat_detected": true.
-                    4. Otherwise, if there is no genuine threat in the frame, mark "threat_detected": false and describe the normal activity.
-                    
-                    Return a JSON object in this format:
-                    {{
-                       "threat_detected": true_or_false,
-                       "threat_description": "A detailed, genuine description of the verified threat or normal scene",
-                       "confidence": {confidence_yolo}
-                    }}
-                    Do not wrap in markdown tags. Return strictly valid raw JSON.
-                    """
-                
-                response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=[
-                        types.Part.from_bytes(data=image_data, mime_type='image/jpeg'),
-                        prompt
-                    ],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                    ),
+                llm = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash",
+                    google_api_key=key,
+                    temperature=0.1,
+                    max_output_tokens=512,
                 )
                 
-                resp_text = response.text.strip()
+                message = HumanMessage(
+                    content=[
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                        {"type": "text", "text": verification_prompt}
+                    ]
+                )
+                
+                # Run blocking LLM call in thread executor to prevent event loop blocking
+                loop = asyncio.get_event_loop()
+                response = await loop.run_in_executor(None, lambda: llm.invoke([message]))
+                
+                resp_text = response.content.strip()
+                # Strip markdown code fence if present
                 if resp_text.startswith("```"):
                     lines = resp_text.splitlines()
                     if lines[0].startswith("```"):
                         lines = lines[1:]
-                    if lines[-1].startswith("```"):
+                    if lines and lines[-1].startswith("```"):
                         lines = lines[:-1]
                     resp_text = "\n".join(lines).strip()
                     
                 result = json.loads(resp_text)
                 threat_detected = result.get("threat_detected", False)
-                threat_description = result.get("threat_description", "Threat verified by Gemini.")
+                threat_description = result.get("threat_description", "Threat verified by Gemini via LangChain.")
                 confidence_score = result.get("confidence", confidence_yolo)
                 
                 verified_successfully = True
-                print(f"[Gemini] API Key #{idx} succeeded. Threat detected: {threat_detected}")
+                print(f"[LangChain-Gemini] API Key #{idx} succeeded. Threat detected: {threat_detected}")
                 break
                 
             except Exception as e:
-                print(f"[Gemini] API Key #{idx} failed/exhausted: {e}. Trying next key...")
+                print(f"[LangChain-Gemini] API Key #{idx} failed/exhausted: {e}. Trying next key...")
                 continue
-                
+        
+        # ─── Strategy 2: OpenRouter Fallback via LangChain ──────────────────
+        if not verified_successfully:
+            openrouter_key = os.getenv("OPENROUTER_API_KEY")
+            openrouter_model = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001")
+            
+            if openrouter_key:
+                try:
+                    from langchain_openai import ChatOpenAI
+                    from langchain_core.messages import HumanMessage as HMsg
+                    
+                    print(f"[LangChain-OpenRouter] Attempting fallback verification via {openrouter_model}...")
+                    
+                    llm = ChatOpenAI(
+                        model=openrouter_model,
+                        openai_api_key=openrouter_key,
+                        openai_api_base="https://openrouter.ai/api/v1",
+                        temperature=0.1,
+                        max_tokens=512,
+                        default_headers={
+                            "HTTP-Referer": "https://surveillance-platform.local",
+                            "X-Title": "AI Surveillance Threat Verification"
+                        }
+                    )
+                    
+                    message = HMsg(
+                        content=[
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                            {"type": "text", "text": verification_prompt}
+                        ]
+                    )
+                    
+                    loop = asyncio.get_event_loop()
+                    response = await loop.run_in_executor(None, lambda: llm.invoke([message]))
+                    
+                    resp_text = response.content.strip()
+                    if resp_text.startswith("```"):
+                        lines = resp_text.splitlines()
+                        if lines[0].startswith("```"):
+                            lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        resp_text = "\n".join(lines).strip()
+                        
+                    result = json.loads(resp_text)
+                    threat_detected = result.get("threat_detected", False)
+                    threat_description = result.get("threat_description", "Threat verified by OpenRouter fallback.")
+                    confidence_score = result.get("confidence", confidence_yolo)
+                    
+                    verified_successfully = True
+                    print(f"[LangChain-OpenRouter] Fallback succeeded. Threat detected: {threat_detected}")
+                    
+                except Exception as e:
+                    print(f"[LangChain-OpenRouter] Fallback failed: {e}")
+    
+    # ─── Strategy 3: Offline Simulation Fallback ────────────────────────────
     if not verified_successfully:
-        print("[Gemini] Fallback to high-fidelity offline verification simulation.")
-        # High fidelity offline simulation rules
+        print("[Verification] All LLM strategies exhausted. Falling back to offline simulation.")
         anomaly_map = {
             "violence": (True, "Physical violence detected. Two individuals engaging in active combat in camera range.", confidence_yolo),
             "loitering": (True, f"Suspicious loitering verified near {camera_zone_tag or 'facility boundary'}. Individual standing motionless for >15 minutes.", confidence_yolo),
@@ -1167,7 +1324,7 @@ async def verify_threat_in_background(
             "anomaly_type": anomaly_type,
             "threat_description": threat_description,
             "snapshot_url": snapshot_url,
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "alert_id": alert_id,
             "is_resolved": not threat_detected
         }
