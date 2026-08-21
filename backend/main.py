@@ -602,7 +602,19 @@ async def create_camera(project_id: str, camera_data: CameraCreate, db: AsyncSes
             on_anomaly_callback=on_anomaly_detected
         )
         
-    return {"message": "Standalone camera saved successfully", "camera": new_camera}
+    return {
+        "message": "Standalone camera saved successfully",
+        "camera": {
+            "id": new_camera.id,
+            "name": new_camera.name,
+            "source_type": new_camera.source_type,
+            "rtsp_url": new_camera.rtsp_url,
+            "zone_tag": new_camera.zone_tag,
+            "ai_active": new_camera.ai_active,
+            "nvr_ip_address": new_camera.nvr_ip_address,
+            "channel_number": new_camera.channel_number
+        }
+    }
 
 @app.delete("/api/cameras/{camera_id}")
 async def delete_camera(camera_id: str, db: AsyncSession = Depends(get_db)):

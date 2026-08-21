@@ -19,19 +19,10 @@ from typing import List, Dict, Tuple, Optional
 import torch
 torch.set_num_threads(1)
 
-# Context manager to suppress raw prints from underlying packages (like GMC warnings)
+# Thread-safe context manager
 @contextlib.contextmanager
 def suppress_stdout_stderr():
-    with open(os.devnull, 'w') as fnull:
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        sys.stdout = fnull
-        sys.stderr = fnull
-        try:
-            yield
-        finally:
-            sys.stdout = old_stdout
-            sys.stderr = old_stderr
+    yield
 
 # YOLO Configuration from environment
 YOLO_MODEL = os.getenv("YOLO_MODEL", "yolov8n.pt")
