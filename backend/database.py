@@ -27,20 +27,27 @@ else:
     if DATABASE_URL.startswith("postgresql://"):
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
     
-    # If using postgresql+asyncpg, strip out sslmode/channel_binding query params
-    # and pass ssl=True in connection arguments instead.
+    # If using postgresql+asyncpg, verify driver is installed; otherwise fallback to SQLite
     if "postgresql+asyncpg" in DATABASE_URL:
-        if "?" in DATABASE_URL:
-            base_url, _ = DATABASE_URL.split("?", 1)
-            DATABASE_URL = base_url
-        import ssl
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        connect_args = {
-            "ssl": ssl_context,
-            "timeout": 30.0  # Allow 30 seconds for Neon database connection wake-up
-        }
+        try:
+            import asyncpg
+            if "?" in DATABASE_URL:
+                base_url, _ = DATABASE_URL.split("?", 1)
+                DATABASE_URL = base_url
+            import ssl
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            connect_args = {
+                "ssl": ssl_context,
+                "timeout": 30.0  # Allow 30 seconds for Neon database connection wake-up
+            }
+        except ImportError:
+            print("[Database Warning] 'asyncpg' driver not found. Falling back to local SQLite database.")
+            BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+            db_path = os.path.join(BASE_DIR, "security.db")
+            DATABASE_URL = f"sqlite+aiosqlite:///{db_path}"
+            connect_args = {"check_same_thread": False}
 
 # Create engine — tuned for high performance with Supabase / PostgreSQL / SQLite
 is_postgres = "postgresql" in DATABASE_URL

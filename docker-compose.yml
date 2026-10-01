@@ -1,0 +1,61 @@
+version: "3.8"
+
+services:
+  # ─── 1. FastAPI AI Vision & Verification Backend ────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: surveillance-backend
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - PORT=8000
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Persist local SQLite database & local storage fallback if needed
+      - backend-data:/app/backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - surveillance-net
+
+  # ─── 2. React / Vite Frontend SPA ──────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: surveillance-frontend
+    restart: always
+    depends_on:
+      - backend
+    networks:
+      - surveillance-net
+
+  # ─── 3. Production Nginx Gateway (SSL & Reverse Proxy) ─────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: surveillance-gateway
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - surveillance-net
+
+networks:
+  surveillance-net:
+    driver: bridge
+
+volumes:
+  backend-data:

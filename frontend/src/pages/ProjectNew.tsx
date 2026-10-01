@@ -2,8 +2,7 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { FolderPlus, School, Home, ShieldAlert, ArrowLeft, ArrowRight, Sparkles } from "lucide-react";
 import { getCurrentUser } from "../utils/auth";
-
-const API_BASE = `http://${window.location.hostname}:8000`;
+import { API_BASE } from "../config/api";
 
 export default function ProjectNew() {
   const [formData, setFormData] = useState({

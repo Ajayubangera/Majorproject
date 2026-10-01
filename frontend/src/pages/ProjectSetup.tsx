@@ -4,8 +4,7 @@ import {
   Cpu, Video, Users, ArrowLeft, Check, AlertCircle, Play, Save, ChevronRight, Settings, Loader2 
 } from "lucide-react";
 import { getCurrentUser } from "../utils/auth";
-
-const API_BASE = `http://${window.location.hostname}:8000`;
+import { API_BASE } from "../config/api";
 
 interface MemberItem {
   id: string;

@@ -2,8 +2,7 @@ import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Shield, Mail, Lock, User, Building, AlertTriangle, CheckCircle, Info, Eye, EyeOff } from "lucide-react";
 import { saveSession } from "../utils/auth";
-
-const API_BASE = `http://${window.location.hostname}:8000`;
+import { API_BASE } from "../config/api";
 
 export default function AuthPage() {
   const [isLogin, setIsLogin] = useState(true);

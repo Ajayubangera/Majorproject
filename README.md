@@ -95,3 +95,18 @@ If you prefer to run them in separate terminal windows:
   ```bash
   npm run dev
   ```
+
+---
+
+### Option C: Commercial Production Deployment (Docker Compose)
+To run the full commercial production stack with Nginx reverse proxy, hardware-accelerated video streaming, and health checks:
+
+```bash
+docker compose up -d --build
+```
+This automatically boots:
+- **Nginx Gateway**: `http://localhost` (Port 80 / 443)
+- **FastAPI AI Backend**: Connected internally with zero-buffering live video streaming
+- **React Frontend**: Optimized production SPA build
+- **Health Check Endpoint**: `http://localhost/api/health`
+

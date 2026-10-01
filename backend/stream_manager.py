@@ -140,10 +140,6 @@ class CameraStreamWorker:
         self._async_events = set()
         self._events_lock = threading.Lock()
 
-        # Ensure project snapshot directory exists
-        self._snapshot_dir = os.path.join(SNAPSHOTS_DIR, project_id)
-        os.makedirs(self._snapshot_dir, exist_ok=True)
-
     @property
     def is_connected(self) -> bool:
         return self._is_connected
@@ -638,8 +634,8 @@ class CameraStreamWorker:
     def _handle_anomaly(self, original_frame: np.ndarray, anomalies: list):
         """
         Handle detected anomaly:
-        1. Save original native resolution snapshot to project threat logs
-        2. Call the anomaly callback (which triggers Gemini verification)
+        1. Encode original native resolution snapshot into memory (no local disk save)
+        2. Call the anomaly callback with in-memory jpeg_data (triggers Gemini verification)
         """
         if not anomalies:
             return
@@ -647,20 +643,15 @@ class CameraStreamWorker:
         # Pick the highest-priority anomaly
         primary = anomalies[0]
 
-        # Save original snapshot at native resolution, JPEG 90% quality
         snapshot_filename = f"snap_{uuid.uuid4()}.jpg"
-        snapshot_path = os.path.join(self._snapshot_dir, snapshot_filename)
 
         try:
             jpeg_data = encode_jpeg(original_frame, JPEG_QUALITY)
-            with open(snapshot_path, "wb") as f:
-                f.write(jpeg_data)
-            print(f"[StreamManager] Snapshot saved: {snapshot_path} ({len(jpeg_data)} bytes)")
         except Exception as e:
-            print(f"[StreamManager] Failed to save snapshot: {e}")
+            print(f"[StreamManager] Failed to encode snapshot: {e}")
             return
 
-        # Trigger callback for Gemini verification
+        # Trigger callback for Gemini verification (purely in-memory, no local disk write)
         if self.on_anomaly_callback:
             try:
                 self.on_anomaly_callback(
@@ -672,7 +663,7 @@ class CameraStreamWorker:
                     description=primary["description"],
                     confidence=primary["confidence"],
                     snapshot_filename=snapshot_filename,
-                    snapshot_path=snapshot_path,
+                    snapshot_path="",
                     image_data=jpeg_data
                 )
             except Exception as e:

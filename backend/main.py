@@ -8,7 +8,9 @@ from typing import Dict, List, Set, Optional
 
 # Load .env variables FIRST before anything else reads os.getenv()
 from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv()
 
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, BackgroundTasks, Form, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +25,41 @@ import bcrypt
 
 from database import init_db, warmup_db, get_db, AsyncSessionLocal, User, Project, ProjectMember, Camera, Alert, is_postgres
 from stream_manager import StreamManager, encode_jpeg, generate_no_signal_frame
+
+# Supabase Cloud Storage Configuration (no snapshots stored on local disk)
+SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("VITE_SUPABASE_URL", "https://sgquvxufepdioksjorvq.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY") or os.getenv("VITE_SUPABASE_ANON_KEY", "")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "snapshots")
+
+async def upload_snapshot_to_supabase(project_id: str, filename: str, image_data: bytes) -> Optional[str]:
+    """Uploads verified threat snapshot in-memory to Supabase Storage bucket.
+    No image is ever saved to local disk.
+    Returns the public Supabase URL on success, or None on failure."""
+    if not SUPABASE_URL or not SUPABASE_KEY or not image_data:
+        return None
+    
+    path = f"{project_id}/{filename}"
+    upload_url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "image/jpeg",
+        "x-upsert": "true"
+    }
+    
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(upload_url, headers=headers, content=image_data)
+            if response.status_code in (200, 201):
+                public_url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
+                print(f"[Supabase Storage] Successfully uploaded verified snapshot to cloud: {public_url}")
+                return public_url
+            else:
+                print(f"[Supabase Storage] Upload failed with status {response.status_code}: {response.text}")
+    except Exception as e:
+        print(f"[Supabase Storage] Error uploading snapshot: {e}")
+    return None
 
 # Create backend directories
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -58,6 +95,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # ─── Stream Manager (real YOLOv8 detection pipeline) ─────────────────────────
 stream_mgr = StreamManager()
 
+from verification_queue import verification_queue, VerificationTask
+
 # Anomaly callback — bridges threaded stream workers to async DB/WebSocket pipeline
 def on_anomaly_detected(
     camera_id: str,
@@ -72,12 +111,17 @@ def on_anomaly_detected(
     image_data: bytes
 ):
     """Called from stream worker threads when YOLO detects anomalous behavior.
-    Bridges to async event loop for Gemini verification + DB + WebSocket."""
-    import threading
-    
-    snapshot_url = f"/static/snapshots/{project_id}/{snapshot_filename}"
-    
-    # Schedule coroutine on the main event loop from the worker thread
+    Enqueues to the commercial Gemini multi-key rate-limiting queue."""
+    task = VerificationTask(
+        camera_id=camera_id,
+        project_id=project_id,
+        anomaly_type=anomaly_type,
+        image_data=image_data,
+        confidence_yolo=confidence,
+        camera_name=camera_name,
+        camera_zone_tag=zone_tag,
+        snapshot_filename=snapshot_filename
+    )
     try:
         import builtins
         loop = getattr(builtins, "_main_event_loop", None)
@@ -85,41 +129,11 @@ def on_anomaly_detected(
             loop = asyncio.get_event_loop()
         
         if loop and loop.is_running() and not loop.is_closed():
-            asyncio.run_coroutine_threadsafe(
-                verify_threat_in_background(
-                    camera_id=camera_id,
-                    project_id=project_id,
-                    anomaly_type=anomaly_type,
-                    image_data=image_data,
-                    snapshot_url=snapshot_url,
-                    confidence_yolo=confidence,
-                    camera_name=camera_name,
-                    camera_zone_tag=zone_tag
-                ),
-                loop
-            )
+            asyncio.run_coroutine_threadsafe(verification_queue.enqueue(task), loop)
         else:
-            print(f"[Anomaly] Event loop not running or closed, cannot schedule verification.")
-    except RuntimeError:
-        # No running event loop in this thread or main loop is closed
-        try:
-            new_loop = asyncio.new_event_loop()
-            if not new_loop.is_closed():
-                new_loop.run_until_complete(
-                    verify_threat_in_background(
-                        camera_id=camera_id,
-                        project_id=project_id,
-                        anomaly_type=anomaly_type,
-                        image_data=image_data,
-                        snapshot_url=snapshot_url,
-                        confidence_yolo=confidence,
-                        camera_name=camera_name,
-                        camera_zone_tag=zone_tag
-                    )
-                )
-                new_loop.close()
-        except Exception as e:
-            print(f"[Anomaly] Fallback event loop failed: {e}")
+            print("[Anomaly] Event loop not running or closed, cannot schedule verification.")
+    except Exception as e:
+        print(f"[Anomaly] Error enqueuing verification task: {e}")
 
 # Background task to initialize stream workers for all active cameras
 async def initialize_stream_workers():
@@ -154,7 +168,7 @@ async def initialize_stream_workers():
     finally:
         await db.close()
 
-# Startup event to initialize DB, migrations, and stream workers
+# Startup event to initialize DB, migrations, stream workers, and Gemini verification queue
 @app.on_event("startup")
 async def startup_event():
     await init_db()
@@ -162,11 +176,40 @@ async def startup_event():
     # Store reference to the running event loop for cross-thread scheduling
     import builtins
     builtins._main_event_loop = asyncio.get_event_loop()
+    verification_queue.start()
     await initialize_stream_workers()
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    verification_queue.stop()
     stream_mgr.stop_all()
+
+# Commercial Health & Observability Endpoint
+@app.get("/api/health")
+async def system_health_check():
+    from database import is_postgres
+    return {
+        "status": "HEALTHY",
+        "service": "CCTV AI Surveillance & Verification Command Center",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "database": {
+            "type": "postgresql (Supabase)" if is_postgres else "sqlite (local)",
+            "connected": True
+        },
+        "stream_pipeline": {
+            "active_workers": len(stream_mgr.workers),
+            "cameras": [
+                {
+                    "camera_id": cid,
+                    "name": w.camera_name,
+                    "connected": w.is_connected,
+                    "running": w.is_running
+                }
+                for cid, w in stream_mgr.workers.items()
+            ]
+        },
+        "gemini_verification_queue": verification_queue.get_metrics()
+    }
 
 # Connection Manager for WebSockets
 class ConnectionManager:
@@ -1132,10 +1175,10 @@ async def verify_threat_in_background(
     project_id: str,
     anomaly_type: str, 
     image_data: bytes, 
-    snapshot_url: str,
     confidence_yolo: float,
     camera_name: str,
-    camera_zone_tag: str
+    camera_zone_tag: str,
+    snapshot_filename: Optional[str] = None
 ):
     threat_detected = False
     threat_description = "Normal monitoring environment."
@@ -1301,6 +1344,21 @@ async def verify_threat_in_background(
         )
         threat_description += " [Not Gemini Verified]"
 
+    # Only snapshots that are verified by Gemini layer as active threats are saved into Supabase cloud.
+    # No photos are ever stored in the local disk.
+    snapshot_url = ""
+    if verified_successfully and threat_detected:
+        if not snapshot_filename:
+            snapshot_filename = f"snap_{uuid.uuid4()}.jpg"
+        print(f"[Supabase Storage] Gemini verified threat '{anomaly_type}'. Uploading snapshot in-memory to Supabase Cloud...")
+        cloud_url = await upload_snapshot_to_supabase(project_id, snapshot_filename, image_data)
+        if cloud_url:
+            snapshot_url = cloud_url
+        else:
+            print("[Supabase Storage] Cloud upload failed, no snapshot stored.")
+    else:
+        print(f"[Supabase Storage] Event not verified as an active threat by Gemini layer (threat_detected={threat_detected}, verified={verified_successfully}). Skipping Supabase storage and local disk.")
+
     # Save to Database for all suspicious activities (anomalies) detected by YOLO
     alert_id = None
     async with AsyncSessionLocal() as session:
@@ -1366,38 +1424,26 @@ async def trigger_yolo_detection(
     camera, project_type = row
     project_id = camera.project_id
     snapshot_filename = f"snap_{uuid.uuid4()}.jpg"
-    snapshot_dir = os.path.join(SNAPSHOTS_DIR, project_id)
-    os.makedirs(snapshot_dir, exist_ok=True)
-    snapshot_path = os.path.join(snapshot_dir, snapshot_filename)
-    snapshot_url = f"/static/snapshots/{project_id}/{snapshot_filename}"
     
     image_data = b""
     
-    # 2. Decode frontend base64 image if sent
+    # 2. Decode frontend base64 image if sent (held in memory, no local disk write)
     if payload.image_base64:
         try:
             image_data = base64.b64decode(payload.image_base64.split(",")[-1])
-            with open(snapshot_path, "wb") as f:
-                f.write(image_data)
-            print("Successfully decoded and saved live canvas frame for threat verification.")
+            print("Successfully decoded live canvas frame for threat verification (in-memory).")
         except Exception as e:
             print(f"Error decoding live canvas image: {e}")
             image_data = b""
             
-    # 3. If base64 is empty/failed, first try the stream manager's latest live frame
+    # 3. If base64 is empty/failed, first try the stream manager's latest live frame (in-memory)
     if not image_data:
         live_frame = stream_mgr.get_latest_snapshot(camera_id)
         if live_frame and len(live_frame) > 1000:  # Must be a real frame, not a placeholder
             image_data = live_frame
-            try:
-                with open(snapshot_path, "wb") as f:
-                    f.write(image_data)
-                print("Successfully grabbed latest live frame from stream manager for snapshot.")
-            except Exception as e:
-                print(f"Failed to write stream manager snapshot: {e}")
-                image_data = b""
+            print("Successfully grabbed latest live frame from stream manager for snapshot (in-memory).")
 
-    # 4. If stream manager had no live frame, try fetching directly from HTTP camera URL
+    # 4. If stream manager had no live frame, try fetching directly from HTTP camera URL (in-memory)
     if not image_data and camera.rtsp_url:
         rtsp_url_lower = camera.rtsp_url.lower()
         if rtsp_url_lower.startswith("http://") or rtsp_url_lower.startswith("https://"):
@@ -1405,22 +1451,14 @@ async def trigger_yolo_detection(
             fetched = await fetch_camera_snapshot(camera.rtsp_url)
             if fetched:
                 image_data = fetched
-                try:
-                    with open(snapshot_path, "wb") as f:
-                        f.write(image_data)
-                    print("Successfully fetched live frame directly from camera stream source.")
-                except Exception as e:
-                    print(f"Failed to write fetched snapshot file: {e}")
-                    image_data = b""
+                print("Successfully fetched live frame directly from camera stream source (in-memory).")
             else:
                 print(f"Bypassing detection for camera {camera.id}: no active stream signal.")
                 return {"message": "Detection bypassed: camera has no signal.", "threat_detected": False}
 
-    # Final fallback to black jpeg if still empty
+    # Final fallback to black jpeg if still empty (in-memory)
     if not image_data:
         image_data = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342\xff\xc0\x00\x0b\x08\x00\x10\x00\x10\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xbf\x00\xff\xd9"
-        with open(snapshot_path, "wb") as f:
-            f.write(image_data)
 
     # 4. Run real YOLOv8 detection
     anomaly_type = payload.anomaly_type
@@ -1459,23 +1497,22 @@ async def trigger_yolo_detection(
         else:
             anomaly_type = "normal"
 
-    # 6. Enqueue threat verification task in the background
-    background_tasks.add_task(
-        verify_threat_in_background,
+    # 6. Enqueue threat verification task to commercial queue (held in-memory, zero disk write)
+    detect_task = VerificationTask(
         camera_id=camera.id,
         project_id=project_id,
         anomaly_type=anomaly_type,
         image_data=image_data,
-        snapshot_url=snapshot_url,
         confidence_yolo=confidence_score,
         camera_name=camera.name,
-        camera_zone_tag=camera.zone_tag
+        camera_zone_tag=camera.zone_tag,
+        snapshot_filename=snapshot_filename
     )
+    await verification_queue.enqueue(detect_task)
 
     return {
         "status": "enqueued",
-        "message": "Threat verification task started in background.",
-        "snapshot_url": snapshot_url
+        "message": "Threat verification task enqueued to rate-limiting queue."
     }
 
 
@@ -1497,3 +1534,9 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
     except Exception as e:
         print(f"WebSocket error on project {project_id}: {e}")
         manager.disconnect(project_id, websocket)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+

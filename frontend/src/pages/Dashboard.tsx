@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { getCurrentUser, clearSession } from "../utils/auth";
 import { getViolenceLevel, getViolenceConfig, type ViolenceFilterType } from "../utils/threatUtils";
+import { API_BASE } from "../config/api";
 
 const parseUTCDate = (dateStr?: string) => {
   if (!dateStr) return null;
@@ -72,8 +73,6 @@ const formatDateTime = (isoOrTs?: string) => {
   } catch (e) {}
   return isoOrTs;
 };
-
-const API_BASE = `http://${window.location.hostname}:8000`;
 
 const getSnapshotUrl = (url?: string) => {
   if (!url) return "";

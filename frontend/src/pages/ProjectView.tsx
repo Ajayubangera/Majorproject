@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 import { getCurrentUser } from "../utils/auth";
 import { getViolenceLevel, getViolenceConfig, type ViolenceFilterType } from "../utils/threatUtils";
+import { API_BASE, getWsUrl } from "../config/api";
 
 const parseUTCDate = (dateStr?: string) => {
   if (!dateStr) return null;
@@ -72,8 +73,6 @@ const formatDateTime = (isoOrTs?: string) => {
   } catch (e) {}
   return isoOrTs;
 };
-
-const API_BASE = `http://${window.location.hostname}:8000`;
 
 const getSnapshotUrl = (url?: string) => {
   if (!url) return "";
@@ -458,7 +457,7 @@ export default function ProjectView() {
     const connectWebSocket = () => {
       if (wsIntentionalCloseRef.current) return;
 
-      const ws = new WebSocket(`ws://${window.location.hostname}:8000/api/projects/${id}/ws`);
+      const ws = new WebSocket(getWsUrl(`/api/projects/${id}/ws`));
       wsRef.current = ws;
 
       ws.onopen = () => {
