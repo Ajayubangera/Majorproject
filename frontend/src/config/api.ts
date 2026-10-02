@@ -2,7 +2,7 @@
  * Centralized API & WebSocket Endpoint Resolver for Production & Development
  * =========================================================================
  * Automatically adapts between:
- * 1. Local Vite dev mode (Vite at :5173 / :3000 -> FastAPI at :8000)
+ * 1. Local Vite dev mode (Vite at any port :5173, :5174, :5175, :3000 -> FastAPI at :8000)
  * 2. Production Docker / Nginx reverse proxy (standard origin, SSL/WSS, no hardcoded port)
  * 3. Environment overrides via VITE_API_BASE
  */
@@ -14,12 +14,16 @@ export const getApiBase = (): string => {
     return envBase.replace(/\/$/, "");
   }
 
-  // Local development fallback
-  if (
-    typeof window !== "undefined" &&
-    (window.location.port === "5173" || window.location.port === "3000")
-  ) {
-    return `http://${window.location.hostname}:8000`;
+  // Local development fallback: handles any dev port (5173, 5174, 5175, 3000, etc.) or DEV mode
+  if (typeof window !== "undefined") {
+    const port = window.location.port;
+    const hostname = window.location.hostname;
+    const isDev = (import.meta as any).env?.DEV;
+    const isDevPort = port && port !== "80" && port !== "443" && port !== "8000";
+
+    if (isDev || isDevPort) {
+      return `http://${hostname}:8000`;
+    }
   }
 
   // Production reverse proxy (Nginx routes /api directly to backend)
@@ -52,8 +56,12 @@ export const getWsUrl = (path: string): string => {
     }
   }
 
-  // Local dev mode with separate frontend/backend ports
-  if (window.location.port === "5173" || window.location.port === "3000") {
+  // Local dev mode with separate frontend/backend ports (5173, 5174, 5175, 3000, etc.)
+  const port = window.location.port;
+  const isDev = (import.meta as any).env?.DEV;
+  const isDevPort = port && port !== "80" && port !== "443" && port !== "8000";
+
+  if (isDev || isDevPort) {
     return `${wsProto}//${window.location.hostname}:8000${cleanPath}`;
   }
 

@@ -1,8 +1,9 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { 
   Plus, Video, ShieldAlert, Folder, MapPin, LogOut, UserCheck, Bell, X, Clock, AlertTriangle,
-  Maximize2, Minimize2, ZoomIn, ZoomOut, RefreshCw, Trash2, RotateCcw, Users, UserPlus, Check
+  Maximize2, Minimize2, ZoomIn, ZoomOut, RefreshCw, Trash2, RotateCcw, Users, UserPlus, Check,
+  Mail, Send, Download, Loader2
 } from "lucide-react";
 import { getCurrentUser, clearSession } from "../utils/auth";
 import { getViolenceLevel, getViolenceConfig, type ViolenceFilterType } from "../utils/threatUtils";
@@ -106,6 +107,7 @@ interface ProjectItem {
   created_at: string;
   cameras_count: number;
   alerts_count: number;
+  snapshots_captured?: number;
 }
 
 export default function Dashboard() {
@@ -117,6 +119,23 @@ export default function Dashboard() {
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Dynamic scroll visibility: track when the bottom 'Create First Project' button is in the viewport
+  const [isBottomBtnVisible, setIsBottomBtnVisible] = useState(false);
+  const bottomBtnRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    if (!bottomBtnRef.current) return;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        setIsBottomBtnVisible(entry.isIntersecting);
+      },
+      { threshold: 0.1 }
+    );
+
+    observer.observe(bottomBtnRef.current);
+    return () => observer.disconnect();
+  }, [projects.length, loading]);
   
   // Alert logs modal state
   const [activeAlertsProjectId, setActiveAlertsProjectId] = useState<string | null>(null);
@@ -141,6 +160,14 @@ export default function Dashboard() {
   const [inviteRole, setInviteRole] = useState("responder");
   const [inviteLoading, setInviteLoading] = useState(false);
   const [accessFeedback, setAccessFeedback] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [emailStatus, setEmailStatus] = useState<any>(null);
+  const [testingEmail, setTestingEmail] = useState(false);
+  const [updatingMemberId, setUpdatingMemberId] = useState<string | null>(null);
+
+  // Delete Project Confirmation Modal State
+  const [projectToDelete, setProjectToDelete] = useState<ProjectItem | null>(null);
+  const [isDeletingProject, setIsDeletingProject] = useState(false);
+  const [deleteProjectFeedback, setDeleteProjectFeedback] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
   // Selected single alert detail modal state
   const [selectedAlert, setSelectedAlert] = useState<any | null>(null);
@@ -201,6 +228,43 @@ export default function Dashboard() {
   const handleAlertZoomReset = () => {
     setAlertZoomScale(1);
     setAlertPanOffset({ x: 0, y: 0 });
+  };
+
+  const [downloadingSnapshot, setDownloadingSnapshot] = useState(false);
+
+  const handleDownloadSnapshot = async (imageUrl?: string, alertData?: any) => {
+    if (!imageUrl) return;
+    setDownloadingSnapshot(true);
+    try {
+      const camName = alertData?.camera_name ? alertData.camera_name.replace(/[^a-zA-Z0-9_-]/g, "_") : "camera";
+      const anomaly = alertData?.anomaly_type || "threat";
+      const ts = new Date().toISOString().slice(0, 19).replace(/[-:]/g, "").replace("T", "_");
+      const filename = `snapshot_${camName}_${anomaly}_${ts}.jpg`;
+
+      const response = await fetch(imageUrl, { mode: "cors" });
+      if (!response.ok) throw new Error("Failed to fetch image directly");
+      const blob = await response.blob();
+      const blobUrl = window.URL.createObjectURL(blob);
+      
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => window.URL.revokeObjectURL(blobUrl), 2000);
+    } catch (err) {
+      const link = document.createElement("a");
+      link.href = imageUrl;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.download = `incident_snapshot_${Date.now()}.jpg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } finally {
+      setDownloadingSnapshot(false);
+    }
   };
 
   const navigate = useNavigate();
@@ -294,15 +358,50 @@ export default function Dashboard() {
     setAccessFeedback(null);
     setLoadingMembers(true);
     try {
-      const response = await fetch(`${API_BASE}/api/projects/${project.id}/members`);
-      if (response.ok) {
-        const data = await response.json();
+      const [membersRes, emailRes] = await Promise.all([
+        fetch(`${API_BASE}/api/projects/${project.id}/members`),
+        fetch(`${API_BASE}/api/projects/${project.id}/email-status`).catch(() => null)
+      ]);
+      if (membersRes.ok) {
+        const data = await membersRes.json();
         setProjectMembers(data);
+      }
+      if (emailRes && emailRes.ok) {
+        const emailData = await emailRes.json();
+        setEmailStatus(emailData);
       }
     } catch (err) {
       console.error("Failed to load project members:", err);
     } finally {
       setLoadingMembers(false);
+    }
+  };
+
+  const handleSendTestEmail = async () => {
+    if (!activeAccessProject) return;
+    setTestingEmail(true);
+    setAccessFeedback(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/projects/${activeAccessProject.id}/test-alert-email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ anomaly_type: "violence" })
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Failed to dispatch test email.");
+      }
+      setAccessFeedback({
+        type: "success",
+        text: data.message || "Test alert email successfully dispatched to registered members!"
+      });
+    } catch (err: any) {
+      setAccessFeedback({
+        type: "error",
+        text: err.message || "Failed to dispatch test alert email."
+      });
+    } finally {
+      setTestingEmail(false);
     }
   };
 
@@ -353,6 +452,94 @@ export default function Dashboard() {
       }
     } catch (err) {
       console.error("Failed to remove member:", err);
+    }
+  };
+
+  const handleUpdateMemberRole = async (memberId: string, newRole: string) => {
+    if (!activeAccessProject) return;
+    setUpdatingMemberId(memberId);
+    setAccessFeedback(null);
+    try {
+      const response = await fetch(`${API_BASE}/api/projects/${activeAccessProject.id}/members/${memberId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: newRole }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.detail || "Failed to update member role.");
+      }
+      setProjectMembers(prev => prev.map(m => m.id === memberId ? { ...m, role: newRole } : m));
+      
+      const emailSent = data.email_delivery?.status === "sent";
+      const recipient = data.member?.email || "";
+      const feedbackText = emailSent
+        ? `Role updated to ${newRole.toUpperCase()}. Notification email sent to ${recipient} via Gmail SMTP! (Please check Inbox/Spam)`
+        : `Role successfully updated to ${newRole.toUpperCase()}.`;
+
+      setAccessFeedback({
+        type: "success",
+        text: feedbackText
+      });
+    } catch (err: any) {
+      setAccessFeedback({
+        type: "error",
+        text: err.message || "Failed to update role."
+      });
+    } finally {
+      setUpdatingMemberId(null);
+    }
+  };
+
+  const handleOpenDeleteProjectModal = (project: ProjectItem) => {
+    setProjectToDelete(project);
+    setDeleteProjectFeedback(null);
+  };
+
+  const handleCloseDeleteProjectModal = () => {
+    if (isDeletingProject) return;
+    setProjectToDelete(null);
+    setDeleteProjectFeedback(null);
+  };
+
+  const handleConfirmDeleteProject = async () => {
+    if (!projectToDelete) return;
+    setIsDeletingProject(true);
+    setDeleteProjectFeedback(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/api/projects/${projectToDelete.id}`, {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail || "Failed to delete project");
+      }
+
+      // Remove from local projects state
+      setProjects((prev) => prev.filter((p) => p.id !== projectToDelete.id));
+
+      // Recalculate summary metrics
+      setAnalytics((prev) => ({
+        ...prev,
+        activeProjects: Math.max(0, prev.activeProjects - 1),
+        onlineCameras: Math.max(0, prev.onlineCameras - (projectToDelete.cameras_count || 0)),
+        securityThreats: Math.max(0, prev.securityThreats - (projectToDelete.alerts_count || 0)),
+      }));
+
+      setIsDeletingProject(false);
+      setProjectToDelete(null);
+    } catch (err: any) {
+      console.error("Error deleting project:", err);
+      setIsDeletingProject(false);
+      setDeleteProjectFeedback({
+        type: "error",
+        text: err.message || "Failed to delete project from Supabase database and cloud storage.",
+      });
     }
   };
 
@@ -640,10 +827,17 @@ export default function Dashboard() {
             <h2 style={{ fontSize: "1.4rem", fontWeight: 700 }}>Monitor Workspaces</h2>
             <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem", marginTop: "2px" }}>Select a project workspace below to view real-time streams and operations</p>
           </div>
+          {/* Top-right Create Project button: Visible at start; vanishes when bottom button scrolls into view */}
           <button 
             onClick={() => navigate("/projects/new")} 
             className="btn-primary"
-            style={{ padding: "12px 20px" }}
+            style={{
+              padding: "12px 20px",
+              transition: "opacity 0.25s ease, transform 0.25s ease",
+              opacity: projects.length === 0 && isBottomBtnVisible ? 0 : 1,
+              pointerEvents: projects.length === 0 && isBottomBtnVisible ? "none" : "auto",
+              transform: projects.length === 0 && isBottomBtnVisible ? "scale(0.9) translateY(-6px)" : "scale(1) translateY(0)"
+            }}
           >
             <Plus size={18} />
             Create New Project
@@ -682,6 +876,7 @@ export default function Dashboard() {
               To start streaming cctv camera channels and running YOLO/Gemini intelligence models, initialize your first project.
             </p>
             <button 
+              ref={bottomBtnRef}
               onClick={() => navigate("/projects/new")} 
               className="btn-primary" 
               style={{ marginTop: "8px" }}
@@ -710,56 +905,116 @@ export default function Dashboard() {
                   overflow: "hidden"
                 }}
               >
-                {/* Project Tag Indicator */}
+                {/* Top Right Header Controls: Tag Indicator, Delete Project Button & Access Management */}
                 <div style={{
                   position: "absolute",
                   top: "0",
                   right: "24px",
-                  background: 
-                    project.project_type === "school" ? "rgba(6, 182, 212, 0.15)" : 
-                    project.project_type === "government" ? "rgba(139, 92, 246, 0.15)" : "rgba(239, 68, 68, 0.15)",
-                  border: 
-                    project.project_type === "school" ? "1px solid var(--secondary)" : 
-                    project.project_type === "government" ? "1px solid var(--primary)" : "1px solid var(--accent)",
-                  color: 
-                    project.project_type === "school" ? "var(--secondary)" : 
-                    project.project_type === "government" ? "var(--primary)" : "var(--accent)",
-                  padding: "4px 10px",
-                  fontSize: "0.7rem",
-                  fontWeight: 600,
-                  borderRadius: "0 0 8px 8px",
-                  textTransform: "uppercase"
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "flex-end",
+                  gap: "8px",
+                  zIndex: 2
                 }}>
-                  {project.project_type}
+                  {/* Top Row: Tag Indicator & Delete Project Button */}
+                  <div style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px"
+                  }}>
+                    {/* Project Tag Indicator */}
+                    <div style={{
+                      background: 
+                        project.project_type === "school" ? "rgba(6, 182, 212, 0.15)" : 
+                        project.project_type === "government" ? "rgba(139, 92, 246, 0.15)" : "rgba(239, 68, 68, 0.15)",
+                      border: 
+                        project.project_type === "school" ? "1px solid var(--secondary)" : 
+                        project.project_type === "government" ? "1px solid var(--primary)" : "1px solid var(--accent)",
+                      color: 
+                        project.project_type === "school" ? "var(--secondary)" : 
+                        project.project_type === "government" ? "var(--primary)" : "var(--accent)",
+                      padding: "4px 10px",
+                      fontSize: "0.7rem",
+                      fontWeight: 600,
+                      borderRadius: "0 0 8px 8px",
+                      textTransform: "uppercase"
+                    }}>
+                      {project.project_type}
+                    </div>
+
+                    {/* Delete Project Button beside the indicator */}
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleOpenDeleteProjectModal(project);
+                      }}
+                      title={`Delete project "${project.name}" (Supabase DB & S3 Cloud)`}
+                      style={{
+                        background: "rgba(239, 68, 68, 0.12)",
+                        border: "1px solid rgba(239, 68, 68, 0.35)",
+                        color: "#f87171",
+                        padding: "4px 9px",
+                        fontSize: "0.7rem",
+                        fontWeight: 600,
+                        borderRadius: "0 0 8px 8px",
+                        cursor: "pointer",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "4px",
+                        transition: "all 0.2s ease",
+                        lineHeight: "1.2"
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.background = "rgba(239, 68, 68, 0.28)";
+                        e.currentTarget.style.borderColor = "rgba(239, 68, 68, 0.8)";
+                        e.currentTarget.style.color = "#ff4d4f";
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.background = "rgba(239, 68, 68, 0.12)";
+                        e.currentTarget.style.borderColor = "rgba(239, 68, 68, 0.35)";
+                        e.currentTarget.style.color = "#f87171";
+                      }}
+                    >
+                      <Trash2 size={12} />
+                      <span>Delete</span>
+                    </button>
+                  </div>
+
+                  {/* Access Management Button: situated in the top right corner below the delete button */}
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleOpenAccessModal(project);
+                    }}
+                    className="btn-secondary"
+                    style={{
+                      padding: "4px 10px",
+                      fontSize: "0.72rem",
+                      fontWeight: 600,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "5px",
+                      borderRadius: "6px",
+                      background: "rgba(139, 92, 246, 0.12)",
+                      border: "1px solid rgba(139, 92, 246, 0.35)",
+                      color: "#c4b5fd",
+                      cursor: "pointer",
+                      transition: "all 0.2s ease"
+                    }}
+                    title="Access Management - Invite & manage team members"
+                  >
+                    <Users size={13} color="#a78bfa" />
+                    <span>Access Management</span>
+                  </button>
                 </div>
 
                 <div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px", paddingRight: "80px", flexWrap: "wrap", gap: "8px" }}>
+                  <div style={{ marginBottom: "8px", paddingRight: "180px" }}>
                     <h3 style={{ fontSize: "1.2rem", fontWeight: 700, margin: 0 }}>
                       {project.name}
                     </h3>
-                    <button
-                      onClick={() => handleOpenAccessModal(project)}
-                      className="btn-secondary"
-                      style={{
-                        padding: "4px 10px",
-                        fontSize: "0.72rem",
-                        fontWeight: 600,
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: "5px",
-                        borderRadius: "6px",
-                        background: "rgba(139, 92, 246, 0.12)",
-                        border: "1px solid rgba(139, 92, 246, 0.35)",
-                        color: "#c4b5fd",
-                        cursor: "pointer",
-                        transition: "all 0.2s ease"
-                      }}
-                      title="Access Management - Invite & manage team members"
-                    >
-                      <Users size={13} color="#a78bfa" />
-                      <span>Access Management</span>
-                    </button>
                   </div>
                   <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "var(--text-secondary)", fontSize: "0.8rem", marginBottom: "16px" }}>
                     <MapPin size={14} color="var(--text-muted)" />
@@ -2018,7 +2273,12 @@ export default function Dashboard() {
                       </div>
                     </div>
                     <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-glass)", padding: "12px", borderRadius: "var(--radius-sm)" }}>
-                      <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", textTransform: "uppercase" }}>Detection Time</span>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", textTransform: "uppercase" }}>Detection Time</span>
+                        <span style={{ fontSize: "0.65rem", color: "var(--secondary)", background: "rgba(6, 182, 212, 0.12)", border: "1px solid rgba(6, 182, 212, 0.25)", padding: "1px 6px", borderRadius: "4px", fontWeight: 700 }}>
+                          IST
+                        </span>
+                      </div>
                       <div style={{ fontSize: "0.95rem", fontWeight: 700, color: "#fff", marginTop: "8px" }}>
                         {formatTime12H(selectedAlert.created_at || selectedAlert.timestamp)}
                       </div>
@@ -2031,6 +2291,26 @@ export default function Dashboard() {
                   <div style={{ flex: 1 }}></div>
 
                   <div style={{ display: "flex", gap: "12px" }}>
+                    <button 
+                      onClick={() => handleDownloadSnapshot(selectedAlert?.snapshot_url, selectedAlert)}
+                      disabled={downloadingSnapshot || !selectedAlert?.snapshot_url}
+                      className="btn-primary"
+                      style={{
+                        flex: 1.2,
+                        justifyContent: "center",
+                        padding: "12px",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        fontSize: "0.85rem",
+                        fontWeight: 600,
+                        cursor: downloadingSnapshot ? "wait" : "pointer"
+                      }}
+                      title="Download full resolution incident snapshot"
+                    >
+                      <Download size={16} />
+                      <span>{downloadingSnapshot ? "Downloading..." : "Download Image"}</span>
+                    </button>
                     <button 
                       onClick={() => setSelectedAlert(null)}
                       className="btn-secondary"
@@ -2193,6 +2473,54 @@ export default function Dashboard() {
                 </div>
               )}
 
+              {/* Automated Anomaly Email Alerts Info Banner */}
+              <div style={{
+                background: "rgba(99, 102, 241, 0.08)",
+                border: "1px solid rgba(99, 102, 241, 0.25)",
+                borderRadius: "var(--radius-sm)",
+                padding: "12px 14px",
+                marginBottom: "20px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px"
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <Mail size={16} color="var(--primary)" />
+                  <span style={{ fontSize: "0.82rem", fontWeight: 700, color: "#fff" }}>
+                    Automated S3 Cloud Anomaly Email Alerts
+                  </span>
+                </div>
+                <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary)", lineHeight: 1.45 }}>
+                  Whenever unusual activity is verified by AI and saved to cloud storage, instant email alerts with camera location, zone tag, and cloud S3 snapshot links are automatically dispatched to the email holders below.
+                </p>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", paddingTop: "8px", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+                  <span style={{ fontSize: "0.72rem", color: emailStatus?.smtp?.configured ? "var(--success)" : "#f59e0b" }}>
+                    {emailStatus?.smtp?.configured ? "● Live SMTP Delivery Ready" : "● Email Service Active (Simulated / Configurable in .env)"}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleSendTestEmail}
+                    disabled={testingEmail || projectMembers.length === 0}
+                    style={{
+                      background: "rgba(99, 102, 241, 0.2)",
+                      border: "1px solid rgba(99, 102, 241, 0.4)",
+                      borderRadius: "4px",
+                      color: "#fff",
+                      padding: "4px 10px",
+                      fontSize: "0.72rem",
+                      fontWeight: 600,
+                      cursor: testingEmail ? "wait" : "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "5px"
+                    }}
+                  >
+                    <Send size={12} />
+                    {testingEmail ? "Sending Alert..." : "Send Test Alert Email"}
+                  </button>
+                </div>
+              </div>
+
               {/* Current Active Members */}
               <div>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
@@ -2228,8 +2556,67 @@ export default function Dashboard() {
                           <UserCheck size={16} color="var(--primary)" />
                           <div>
                             <div style={{ fontSize: "0.85rem", fontWeight: 600, color: "#fff" }}>{member.email}</div>
-                            <div style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>
-                              Role: <span style={{ textTransform: "capitalize", color: "var(--secondary)" }}>{member.role}</span>
+                            <div style={{ fontSize: "0.7rem", color: "var(--text-muted)", display: "flex", flexWrap: "wrap", alignItems: "center", gap: "8px", marginTop: "4px" }}>
+                              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                <span>Role:</span>
+                                <select
+                                  value={member.role}
+                                  onChange={(e) => handleUpdateMemberRole(member.id, e.target.value)}
+                                  disabled={updatingMemberId === member.id}
+                                  title="Click to change member role (Admin / Responder / Viewer)"
+                                  style={{
+                                    background: member.role === "admin" ? "rgba(6, 182, 212, 0.18)" : member.role === "responder" ? "rgba(245, 158, 11, 0.18)" : "rgba(255, 255, 255, 0.08)",
+                                    border: `1px solid ${member.role === "admin" ? "var(--secondary)" : member.role === "responder" ? "var(--warning)" : "var(--border-glass)"}`,
+                                    color: member.role === "admin" ? "var(--secondary)" : member.role === "responder" ? "var(--warning)" : "var(--text-secondary)",
+                                    padding: "2px 8px",
+                                    borderRadius: "6px",
+                                    fontSize: "0.72rem",
+                                    fontWeight: 700,
+                                    textTransform: "capitalize",
+                                    outline: "none",
+                                    cursor: updatingMemberId === member.id ? "wait" : "pointer",
+                                    opacity: updatingMemberId === member.id ? 0.6 : 1
+                                  }}
+                                >
+                                  <option value="admin" style={{ background: "#160f33", color: "#fff" }}>Admin (Full Control)</option>
+                                  <option value="responder" style={{ background: "#160f33", color: "#fff" }}>Responder (Acknowledge & Alerts)</option>
+                                  <option value="viewer" style={{ background: "#160f33", color: "#fff" }}>Viewer (Read-Only)</option>
+                                </select>
+
+                                {updatingMemberId === member.id && (
+                                  <span style={{ fontSize: "0.68rem", color: "#38bdf8", display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                                    <Loader2 size={11} className="animate-spin" />
+                                    Sending mail...
+                                  </span>
+                                )}
+                              </div>
+
+                              {member.role !== "viewer" ? (
+                                <span style={{
+                                  fontSize: "0.65rem",
+                                  background: "rgba(16, 185, 129, 0.15)",
+                                  color: "var(--success)",
+                                  padding: "2px 7px",
+                                  borderRadius: "10px",
+                                  border: "1px solid rgba(16, 185, 129, 0.3)",
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "3px"
+                                }}>
+                                  📧 Receives Threat Alerts
+                                </span>
+                              ) : (
+                                <span style={{
+                                  fontSize: "0.65rem",
+                                  background: "rgba(255, 255, 255, 0.05)",
+                                  color: "var(--text-muted)",
+                                  padding: "2px 7px",
+                                  borderRadius: "10px",
+                                  border: "1px solid var(--border-glass)"
+                                }}>
+                                  👁️ Read-Only Feeds
+                                </span>
+                              )}
                             </div>
                           </div>
                         </div>
@@ -2277,6 +2664,181 @@ export default function Dashboard() {
               </button>
             </div>
 
+          </div>
+        </div>
+      )}
+
+      {/* Delete Project Confirmation Modal */}
+      {projectToDelete && (
+        <div style={{
+          position: "fixed",
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: "rgba(0, 0, 0, 0.8)",
+          backdropFilter: "blur(6px)",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          zIndex: 1100,
+          padding: "20px"
+        }}>
+          <div style={{
+            background: "#161226",
+            border: "1px solid rgba(239, 68, 68, 0.4)",
+            borderRadius: "var(--radius-md)",
+            width: "100%",
+            maxWidth: "500px",
+            boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.7), 0 0 35px rgba(239, 68, 68, 0.18)",
+            overflow: "hidden",
+            display: "flex",
+            flexDirection: "column",
+            animation: "fadeIn 0.2s ease-out"
+          }}>
+            {/* Header */}
+            <div style={{
+              padding: "18px 24px",
+              borderBottom: "1px solid rgba(239, 68, 68, 0.2)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              background: "rgba(239, 68, 68, 0.08)"
+            }}>
+              <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                <div style={{
+                  width: "38px",
+                  height: "38px",
+                  borderRadius: "8px",
+                  background: "rgba(239, 68, 68, 0.2)",
+                  border: "1px solid rgba(239, 68, 68, 0.4)",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center"
+                }}>
+                  <AlertTriangle size={20} color="var(--danger)" />
+                </div>
+                <div>
+                  <h3 style={{ margin: 0, fontSize: "1.1rem", fontWeight: 700, color: "#fff" }}>
+                    Delete Project
+                  </h3>
+                  <p style={{ margin: 0, fontSize: "0.74rem", color: "var(--text-muted)" }}>
+                    Permanent Cloud & Supabase DB Deletion
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleCloseDeleteProjectModal}
+                disabled={isDeletingProject}
+                style={{
+                  background: "transparent",
+                  border: "none",
+                  color: "var(--text-muted)",
+                  cursor: isDeletingProject ? "not-allowed" : "pointer",
+                  padding: "4px"
+                }}
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Body */}
+            <div style={{ padding: "24px", display: "flex", flexDirection: "column", gap: "16px" }}>
+              <p style={{ margin: 0, fontSize: "0.95rem", color: "var(--text-secondary)", lineHeight: 1.5 }}>
+                Are you sure you want to delete the project <strong style={{ color: "#fff" }}>"{projectToDelete.name}"</strong>?
+              </p>
+
+              {/* Impact Warning Box */}
+              <div style={{
+                background: "rgba(239, 68, 68, 0.06)",
+                border: "1px solid rgba(239, 68, 68, 0.2)",
+                borderRadius: "var(--radius-sm)",
+                padding: "14px",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px"
+              }}>
+                <div style={{ fontSize: "0.78rem", fontWeight: 700, color: "#f87171" }}>
+                  ⚠️ This action cannot be undone:
+                </div>
+                <ul style={{ margin: 0, paddingLeft: "18px", fontSize: "0.78rem", color: "var(--text-secondary)", display: "flex", flexDirection: "column", gap: "5px" }}>
+                  <li>All <strong>{projectToDelete.cameras_count || 0} CCTV camera streams</strong> will be stopped and removed.</li>
+                  <li>All <strong>{projectToDelete.alerts_count || 0} AI threat logs</strong> in Supabase Database will be deleted.</li>
+                  <li>All verified threat snapshot files in <strong>Supabase S3 Cloud Storage</strong> will be permanently wiped.</li>
+                  <li>Workspace member access and roles will be removed.</li>
+                </ul>
+              </div>
+
+              {deleteProjectFeedback && (
+                <div style={{
+                  padding: "10px 14px",
+                  borderRadius: "var(--radius-sm)",
+                  background: "rgba(239, 68, 68, 0.15)",
+                  border: "1px solid rgba(239, 68, 68, 0.3)",
+                  color: "#fca5a5",
+                  fontSize: "0.8rem",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px"
+                }}>
+                  <AlertTriangle size={15} color="#fca5a5" />
+                  <span>{deleteProjectFeedback.text}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Actions */}
+            <div style={{
+              padding: "16px 24px",
+              borderTop: "1px solid var(--border-glass)",
+              display: "flex",
+              justifyContent: "flex-end",
+              gap: "12px",
+              background: "rgba(255,255,255,0.01)"
+            }}>
+              <button
+                type="button"
+                onClick={handleCloseDeleteProjectModal}
+                disabled={isDeletingProject}
+                className="btn-secondary"
+                style={{ padding: "8px 18px", fontSize: "0.85rem", cursor: isDeletingProject ? "not-allowed" : "pointer" }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeleteProject}
+                disabled={isDeletingProject}
+                style={{
+                  background: isDeletingProject ? "rgba(239, 68, 68, 0.4)" : "var(--danger)",
+                  border: "1px solid var(--danger)",
+                  color: "#fff",
+                  padding: "8px 20px",
+                  borderRadius: "var(--radius-sm)",
+                  fontSize: "0.85rem",
+                  fontWeight: 600,
+                  cursor: isDeletingProject ? "wait" : "pointer",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "8px",
+                  boxShadow: "0 4px 14px rgba(239, 68, 68, 0.35)",
+                  transition: "all 0.2s ease"
+                }}
+              >
+                {isDeletingProject ? (
+                  <>
+                    <RefreshCw size={14} className="spin" />
+                    <span>Deleting from Cloud & DB...</span>
+                  </>
+                ) : (
+                  <>
+                    <Trash2 size={14} />
+                    <span>Yes, Delete Project</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </div>
       )}

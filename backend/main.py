@@ -3,7 +3,7 @@ import uuid
 import json
 import base64
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Set, Optional
 
 # Load .env variables FIRST before anything else reads os.getenv()
@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.future import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, update, text
+from sqlalchemy import func, update, text, delete
 from jose import JWTError, jwt
 import bcrypt
 
@@ -31,14 +31,96 @@ SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("VITE_SUPABASE_URL", "http
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY") or os.getenv("VITE_SUPABASE_ANON_KEY", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "snapshots")
 
-async def upload_snapshot_to_supabase(project_id: str, filename: str, image_data: bytes) -> Optional[str]:
+def sanitize_storage_segment(segment: Optional[str], default: str = "general") -> str:
+    """Sanitizes strings for safe, clean S3 / Supabase object path segments."""
+    if not segment:
+        return default
+    import re
+    s = str(segment).strip()
+    s = re.sub(r'[/\\:*?"<>|#%&{}\\<>*?/$!\'":@+`|=.]', '_', s)
+    s = re.sub(r'\s+', '_', s)
+    s = re.sub(r'_+', '_', s).strip('_')
+    return s if s else default
+
+async def upload_snapshot_to_supabase(
+    project_id: str,
+    filename: str,
+    image_data: bytes,
+    camera_id: Optional[str] = None,
+    camera_name: Optional[str] = None,
+    anomaly_type: Optional[str] = None,
+    project_name: Optional[str] = None,
+    account_name: Optional[str] = None
+) -> Optional[str]:
     """Uploads verified threat snapshot in-memory to Supabase Storage bucket.
+    Organizes files hierarchically: {account_name}/{project_name}/{camera_name}/{filename}
     No image is ever saved to local disk.
     Returns the public Supabase URL on success, or None on failure."""
     if not SUPABASE_URL or not SUPABASE_KEY or not image_data:
         return None
-    
-    path = f"{project_id}/{filename}"
+
+    resolved_account = account_name
+    resolved_project = project_name
+    resolved_camera = camera_name
+
+    # Query DB to resolve missing components
+    if not (resolved_account and resolved_project and resolved_camera):
+        try:
+            async with AsyncSessionLocal() as session:
+                from sqlalchemy import select
+                # 1. Resolve Project and Account
+                if project_id and not (resolved_account and resolved_project):
+                    proj_res = await session.execute(select(Project).where(Project.id == project_id))
+                    proj = proj_res.scalar_one_or_none()
+                    if proj:
+                        if not resolved_project and proj.name:
+                            resolved_project = proj.name
+                        
+                        if not resolved_account and proj.owner_id:
+                            # Look up user account / organization name
+                            user_res = await session.execute(
+                                select(User).where((User.email == proj.owner_id) | (User.id == proj.owner_id))
+                            )
+                            user = user_res.scalar_one_or_none()
+                            if user:
+                                resolved_account = user.organization_name or user.full_name or user.email.split("@")[0]
+                            else:
+                                resolved_account = proj.owner_id.split("@")[0] if "@" in proj.owner_id else proj.owner_id
+
+                # 2. Resolve Camera Name
+                if not resolved_camera and camera_id:
+                    cam_res = await session.execute(select(Camera).where(Camera.id == camera_id))
+                    cam = cam_res.scalar_one_or_none()
+                    if cam and cam.name:
+                        resolved_camera = cam.name
+
+        except Exception as db_err:
+            print(f"[Supabase Storage] Notice: DB resolution for storage path used fallbacks: {db_err}")
+
+    # Fallbacks if still unresolved
+    resolved_account = resolved_account or "account"
+    resolved_project = resolved_project or (f"project_{project_id[:8]}" if project_id else "project")
+    resolved_camera = resolved_camera or "camera"
+
+    # Sanitize each segment for S3 / URL safety
+    safe_account = sanitize_storage_segment(resolved_account, "account")
+    safe_project = sanitize_storage_segment(resolved_project, "project")
+    safe_camera = sanitize_storage_segment(resolved_camera, "camera")
+
+    # Format a clean verified snapshot filename if generic
+    clean_filename = filename
+    if not clean_filename or clean_filename.startswith("snap_") or not any(char.isalpha() for char in clean_filename):
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        anomaly_str = sanitize_storage_segment(anomaly_type, "threat") if anomaly_type else "incident"
+        clean_filename = f"verified_{anomaly_str}_{ts}_{uuid.uuid4().hex[:6]}.jpg"
+    else:
+        base_name, ext = os.path.splitext(clean_filename)
+        safe_base = sanitize_storage_segment(base_name, "verified_threat")
+        ext = ext if ext.lower() in [".jpg", ".jpeg", ".png"] else ".jpg"
+        clean_filename = f"{safe_base}{ext}"
+
+    # Hierarchical cloud S3 path: account_name/project_name/camera_name/verified_snapshots_images
+    path = f"{safe_account}/{safe_project}/{safe_camera}/{clean_filename}"
     upload_url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/{SUPABASE_BUCKET}/{path}"
     headers = {
         "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -53,13 +135,123 @@ async def upload_snapshot_to_supabase(project_id: str, filename: str, image_data
             response = await client.post(upload_url, headers=headers, content=image_data)
             if response.status_code in (200, 201):
                 public_url = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/{SUPABASE_BUCKET}/{path}"
-                print(f"[Supabase Storage] Successfully uploaded verified snapshot to cloud: {public_url}")
+                print(f"[Supabase Storage] Successfully uploaded verified snapshot to cloud hierarchy: {path}")
                 return public_url
             else:
                 print(f"[Supabase Storage] Upload failed with status {response.status_code}: {response.text}")
     except Exception as e:
         print(f"[Supabase Storage] Error uploading snapshot: {e}")
     return None
+
+async def delete_project_cloud_snapshots(
+    project_id: str,
+    project_name: Optional[str] = None,
+    owner_id: Optional[str] = None,
+    snapshot_urls: Optional[List[str]] = None
+) -> int:
+    """Deletes all snapshots stored in Supabase S3 cloud storage for a given project.
+    Removes files by:
+    1. Parsing all snapshot URLs recorded in the alerts table
+    2. Scanning and deleting objects under the project's cloud folder hierarchy:
+       - {account_name}/{project_name}/...
+       - {project_id}/...
+    Also removes local directory fallback cache if present.
+    Returns total number of cloud files deleted."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return 0
+
+    import httpx
+    prefixes_to_delete = set()
+
+    # 1. Parse individual snapshot URLs from database records
+    if snapshot_urls:
+        for url in snapshot_urls:
+            if not url:
+                continue
+            marker = f"/{SUPABASE_BUCKET}/"
+            if marker in url:
+                parts = url.split(marker, 1)
+                if len(parts) > 1 and parts[1]:
+                    clean_p = parts[1].split("?")[0]
+                    prefixes_to_delete.add(clean_p)
+
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json"
+    }
+    base = SUPABASE_URL.rstrip('/')
+    list_url = f"{base}/storage/v1/object/list/{SUPABASE_BUCKET}"
+
+    # Helper function to list all objects under a folder prefix
+    async def list_prefix_recursive(client: httpx.AsyncClient, current_prefix: str) -> List[str]:
+        found = []
+        try:
+            res = await client.post(list_url, headers=headers, json={"prefix": current_prefix, "limit": 1000})
+            if res.status_code == 200:
+                for item in res.json():
+                    name = item.get("name")
+                    if not name:
+                        continue
+                    item_path = f"{current_prefix}/{name}".strip("/")
+                    if item.get("id") is not None:
+                        found.append(item_path)
+                    else:
+                        sub_items = await list_prefix_recursive(client, item_path)
+                        found.extend(sub_items)
+        except Exception as err:
+            print(f"[Supabase Storage] List prefix error for '{current_prefix}': {err}")
+        return found
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            # Check legacy project_id prefix
+            if project_id:
+                legacy_items = await list_prefix_recursive(client, project_id)
+                for item in legacy_items:
+                    prefixes_to_delete.add(item)
+
+            # Check hierarchical account/project prefix
+            if project_name:
+                safe_proj = sanitize_storage_segment(project_name, "")
+                if safe_proj:
+                    top_res = await client.post(list_url, headers=headers, json={"prefix": "", "limit": 100})
+                    if top_res.status_code == 200:
+                        for top_item in top_res.json():
+                            account_folder = top_item.get("name")
+                            if account_folder and top_item.get("id") is None:
+                                folder_prefix = f"{account_folder}/{safe_proj}"
+                                sub_files = await list_prefix_recursive(client, folder_prefix)
+                                for f in sub_files:
+                                    prefixes_to_delete.add(f)
+
+            # Execute batch deletion via Supabase S3 delete endpoint
+            del_url = f"{base}/storage/v1/object/{SUPABASE_BUCKET}"
+            all_files = list(prefixes_to_delete)
+            deleted_count = 0
+            for i in range(0, len(all_files), 100):
+                batch = all_files[i:i + 100]
+                del_res = await client.request("DELETE", del_url, headers=headers, json={"prefixes": batch})
+                if del_res.status_code == 200:
+                    deleted_count += len(batch)
+                    print(f"[Supabase Storage] Deleted {len(batch)} cloud snapshots for project '{project_name}'.")
+                else:
+                    print(f"[Supabase Storage] Batch delete failed ({del_res.status_code}): {del_res.text}")
+
+            # Also clean local disk cache if exists
+            try:
+                import shutil
+                local_dir = os.path.join(SNAPSHOTS_DIR, project_id)
+                if os.path.exists(local_dir):
+                    shutil.rmtree(local_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+            return deleted_count
+    except Exception as e:
+        print(f"[Supabase Storage] Error cleaning project cloud storage: {e}")
+        return 0
+
 
 # Create backend directories
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -256,6 +448,13 @@ class UserLogin(BaseModel):
     password: str
     rememberMe: bool = False
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+    newPassword: str = Field(..., min_length=8)
+
 class ProjectCreate(BaseModel):
     name: str = Field(..., min_length=2)
     location: str = Field(..., min_length=2)
@@ -277,6 +476,10 @@ class CameraUpdate(BaseModel):
     zone_tag: Optional[str] = None
     nvr_ip_address: Optional[str] = None
     channel_number: Optional[int] = 1
+
+class CameraAccessBatchUpdate(BaseModel):
+    camera_ids: List[str]
+    allowed_members: List[str]  # List of member emails or roles; empty or ["*"] means all members
 
 class NVRConfig(BaseModel):
     device_label: str
@@ -315,6 +518,26 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+def create_password_reset_token(email: str) -> str:
+    """Generates a secure, signed JWT token valid for 30 minutes for password reset."""
+    expire = datetime.utcnow() + timedelta(minutes=30)
+    to_encode = {
+        "sub": email,
+        "type": "password_reset",
+        "exp": expire
+    }
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def verify_password_reset_token(token: str) -> Optional[str]:
+    """Validates the reset token and returns the user's email if valid."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "password_reset":
+            return None
+        return payload.get("sub")
+    except JWTError:
+        return None
+
 # Dependency to check auth
 async def get_current_user(token: str):
     credentials_exception = HTTPException(
@@ -352,6 +575,17 @@ async def register(user_data: UserRegister, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(new_user)
     
+    # Automatically dispatch welcome email to user's registered email
+    try:
+        from email_service import email_service
+        asyncio.create_task(email_service.send_account_welcome_email(
+            full_name=new_user.full_name,
+            email=new_user.email,
+            organization_name=new_user.organization_name
+        ))
+    except Exception as email_err:
+        print(f"[EmailService] Notice: Could not dispatch registration welcome email: {email_err}")
+
     return {"message": "Registration successful", "user": {"email": new_user.email, "fullName": new_user.full_name}}
 
 @app.post("/api/auth/login")
@@ -382,6 +616,58 @@ async def login(user_data: UserLogin, db: AsyncSession = Depends(get_db)):
         }
     }
 
+@app.post("/api/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordRequest, db: AsyncSession = Depends(get_db)):
+    email = payload.email.strip().lower()
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalars().first()
+    
+    if not user:
+        print(f"[ForgotPassword] Request received for unknown email: {email}")
+        return {
+            "message": "If an account with this email exists, a password reset link has been dispatched to your inbox."
+        }
+
+    reset_token = create_password_reset_token(user.email)
+    try:
+        from email_service import email_service
+        asyncio.create_task(email_service.send_password_reset_email(
+            full_name=user.full_name,
+            email=user.email,
+            reset_token=reset_token
+        ))
+        print(f"[ForgotPassword] Dispatched reset email task for {email}")
+    except Exception as err:
+        print(f"[ForgotPassword] Error dispatching reset email: {err}")
+
+    return {
+        "message": "If an account with this email exists, a password reset link has been dispatched to your inbox."
+    }
+
+@app.post("/api/auth/reset-password")
+async def reset_password(payload: ResetPasswordRequest, db: AsyncSession = Depends(get_db)):
+    email = verify_password_reset_token(payload.token)
+    if not email:
+        raise HTTPException(
+            status_code=400,
+            detail="The password reset link is invalid or has expired (links expire after 30 minutes). Please request a new one."
+        )
+
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Account not found.")
+
+    user.password_hash = get_password_hash(payload.newPassword)
+    await db.commit()
+    await db.refresh(user)
+    print(f"[PasswordReset] Successfully updated password for {email}")
+
+    return {
+        "message": "Password reset successful! You can now log in with your new password.",
+        "email": user.email
+    }
+
 @app.get("/api/projects")
 async def list_projects(email: str, db: AsyncSession = Depends(get_db)):
     # Optimized single-query project listing with camera and active unread alert count aggregation
@@ -393,6 +679,7 @@ async def list_projects(email: str, db: AsyncSession = Depends(get_db)):
             p.project_type,
             p.owner_id,
             p.created_at,
+            COALESCE(p.snapshots_captured, 0) as snapshots_captured,
             COALESCE(c.cam_count, 0) as cameras_count,
             COALESCE(a.alert_count, 0) as alerts_count
         FROM projects p
@@ -423,6 +710,7 @@ async def list_projects(email: str, db: AsyncSession = Depends(get_db)):
             "project_type": r["project_type"],
             "owner_id": r["owner_id"],
             "created_at": r["created_at"],
+            "snapshots_captured": int(r.get("snapshots_captured", 0)),
             "cameras_count": int(r["cameras_count"]),
             "alerts_count": int(r["alerts_count"])
         })
@@ -458,6 +746,7 @@ async def get_project_details(project_id: str, db: AsyncSession = Depends(get_db
         single_sql = text("""
             SELECT 
                 p.id, p.name, p.location, p.project_type, p.owner_id, p.created_at,
+                COALESCE(p.snapshots_captured, 0) as snapshots_captured,
                 COALESCE((
                     SELECT json_agg(json_build_object(
                         'id', c.id,
@@ -466,6 +755,8 @@ async def get_project_details(project_id: str, db: AsyncSession = Depends(get_db
                         'rtsp_url', c.rtsp_url,
                         'zone_tag', c.zone_tag,
                         'ai_active', c.ai_active,
+                        'allowed_members', c.allowed_members,
+                        'snapshots_captured', COALESCE(c.snapshots_captured, 0),
                         'nvr_ip_address', c.nvr_ip_address,
                         'channel_number', c.channel_number
                     ))
@@ -494,7 +785,7 @@ async def get_project_details(project_id: str, db: AsyncSession = Depends(get_db
                         'is_resolved', a.is_resolved,
                         'is_trashed', a.is_trashed,
                         'is_new', a.is_new,
-                        'created_at', to_char(a.created_at, 'YYYY-MM-DD HH24:MI:SS')
+                        'created_at', to_char(a.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
                     ) ORDER BY a.created_at DESC)
                     FROM alerts a
                     LEFT JOIN cameras cam ON a.camera_id = cam.id
@@ -519,7 +810,8 @@ async def get_project_details(project_id: str, db: AsyncSession = Depends(get_db
                 "location": row["location"],
                 "project_type": row["project_type"],
                 "owner_id": row["owner_id"],
-                "created_at": row["created_at"]
+                "created_at": row["created_at"],
+                "snapshots_captured": int(row.get("snapshots_captured", 0))
             },
             "cameras": cams,
             "members": members,
@@ -560,7 +852,7 @@ async def get_project_details(project_id: str, db: AsyncSession = Depends(get_db
                 "is_resolved": alert.is_resolved,
                 "is_trashed": alert.is_trashed,
                 "is_new": alert.is_new,
-                "created_at": alert.created_at.strftime("%Y-%m-%d %H:%M:%S") if alert.created_at else None
+                "created_at": alert.created_at.strftime("%Y-%m-%dT%H:%M:%SZ") if alert.created_at else None
             })
             
         return {
@@ -570,18 +862,107 @@ async def get_project_details(project_id: str, db: AsyncSession = Depends(get_db
                 "location": project.location,
                 "project_type": project.project_type,
                 "owner_id": project.owner_id,
-                "created_at": project.created_at
+                "created_at": project.created_at,
+                "snapshots_captured": getattr(project, "snapshots_captured", 0)
             },
-            "cameras": [{"id": c.id, "name": c.name, "source_type": c.source_type, "rtsp_url": c.rtsp_url, "zone_tag": c.zone_tag, "ai_active": c.ai_active, "nvr_ip_address": c.nvr_ip_address, "channel_number": c.channel_number} for c in cameras],
+            "cameras": [{
+                "id": c.id,
+                "name": c.name,
+                "source_type": c.source_type,
+                "rtsp_url": c.rtsp_url,
+                "zone_tag": c.zone_tag,
+                "ai_active": c.ai_active,
+                "allowed_members": c.allowed_members,
+                "snapshots_captured": getattr(c, "snapshots_captured", 0),
+                "nvr_ip_address": c.nvr_ip_address,
+                "channel_number": c.channel_number
+            } for c in cameras],
             "members": [{"id": m.id, "email": m.email, "role": m.role} for m in members],
             "alerts": alerts_list
         }
+
+@app.delete("/api/projects/{project_id}")
+async def delete_project(project_id: str, db: AsyncSession = Depends(get_db)):
+    """Permanently deletes a project, including:
+    1. Stopping all active camera streams/workers.
+    2. Deleting all snapshots from Supabase S3 cloud storage.
+    3. Deleting all alerts, cameras, workspace members, and the project record from Supabase PostgreSQL.
+    """
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_name = project.name
+    owner_id = project.owner_id
+
+    # 1. Stop camera streams if active
+    try:
+        cam_res = await db.execute(select(Camera).where(Camera.project_id == project_id))
+        cameras = cam_res.scalars().all()
+        from stream_manager import stream_manager
+        for cam in cameras:
+            try:
+                stream_manager.stop_camera(cam.id)
+                if cam.id in stream_manager.cameras:
+                    del stream_manager.cameras[cam.id]
+            except Exception as cam_err:
+                print(f"[DeleteProject] Error stopping camera {cam.id}: {cam_err}")
+    except Exception as e:
+        print(f"[DeleteProject] Error checking cameras to stop: {e}")
+
+    # 2. Collect snapshot URLs for Supabase S3 deletion
+    cloud_deleted = 0
+    try:
+        alert_res = await db.execute(select(Alert.snapshot_url).where(Alert.project_id == project_id))
+        snapshot_urls = [row[0] for row in alert_res.fetchall() if row[0]]
+
+        # Delete from Supabase S3 cloud storage
+        cloud_deleted = await delete_project_cloud_snapshots(
+            project_id=project_id,
+            project_name=project_name,
+            owner_id=owner_id,
+            snapshot_urls=snapshot_urls
+        )
+    except Exception as s3_err:
+        print(f"[DeleteProject] Cloud deletion warning: {s3_err}")
+
+    # 3. Delete all related records in Supabase PostgreSQL DB
+    try:
+        await db.execute(delete(Alert).where(Alert.project_id == project_id))
+        await db.execute(delete(Camera).where(Camera.project_id == project_id))
+        await db.execute(delete(ProjectMember).where(ProjectMember.project_id == project_id))
+        await db.execute(delete(Project).where(Project.id == project_id))
+        await db.commit()
+    except Exception as db_err:
+        await db.rollback()
+        print(f"[DeleteProject] Database delete failed: {db_err}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete project from database: {str(db_err)}")
+
+    print(f"[DeleteProject] Successfully deleted project '{project_name}' ({project_id}) from Supabase DB and Cloud Storage ({cloud_deleted} files removed).")
+    return {
+        "success": True,
+        "message": f"Project '{project_name}' and all associated cloud snapshots were permanently deleted.",
+        "project_id": project_id,
+        "cloud_files_deleted": cloud_deleted
+    }
 
 @app.get("/api/projects/{project_id}/cameras")
 async def get_project_cameras(project_id: str, db: AsyncSession = Depends(get_db)):
     cameras_result = await db.execute(select(Camera).where(Camera.project_id == project_id))
     cameras = cameras_result.scalars().all()
-    return [{"id": c.id, "name": c.name, "source_type": c.source_type, "rtsp_url": c.rtsp_url, "zone_tag": c.zone_tag, "ai_active": c.ai_active, "nvr_ip_address": c.nvr_ip_address, "channel_number": c.channel_number} for c in cameras]
+    return [{
+        "id": c.id,
+        "name": c.name,
+        "source_type": c.source_type,
+        "rtsp_url": c.rtsp_url,
+        "zone_tag": c.zone_tag,
+        "ai_active": c.ai_active,
+        "allowed_members": c.allowed_members,
+        "snapshots_captured": getattr(c, "snapshots_captured", 0),
+        "nvr_ip_address": c.nvr_ip_address,
+        "channel_number": c.channel_number
+    } for c in cameras]
 
 @app.get("/api/projects/{project_id}/members")
 async def get_project_members(project_id: str, db: AsyncSession = Depends(get_db)):
@@ -605,6 +986,25 @@ async def add_project_member(project_id: str, invite: ProjectMemberInvite, db: A
     db.add(new_member)
     await db.commit()
     await db.refresh(new_member)
+
+    # Fetch project details for welcome/access notification email
+    try:
+        proj_res = await db.execute(select(Project).where(Project.id == project_id))
+        project = proj_res.scalar_one_or_none()
+        from email_service import email_service
+        project_name = project.name if project else "Surveillance Workspace"
+        project_location = project.location if project else "Facility"
+        project_type = project.project_type if project else "facility"
+        asyncio.create_task(email_service.send_member_welcome_email(
+            member_email=new_member.email,
+            role=new_member.role,
+            project_name=project_name,
+            project_location=project_location,
+            project_type=project_type
+        ))
+    except Exception as welcome_err:
+        print(f"[EmailService] Notice: Could not dispatch welcome email: {welcome_err}")
+
     return {"message": "Member added successfully", "member": {"id": new_member.id, "email": new_member.email, "role": new_member.role}}
 
 @app.delete("/api/projects/{project_id}/members/{member_id}")
@@ -617,33 +1017,194 @@ async def delete_project_member(project_id: str, member_id: str, db: AsyncSessio
     await db.commit()
     return {"message": "Member access removed successfully"}
 
+class MemberRoleUpdate(BaseModel):
+    role: str = Field(..., description="admin, responder, viewer")
+
+@app.patch("/api/projects/{project_id}/members/{member_id}")
+async def update_project_member_role(
+    project_id: str,
+    member_id: str,
+    payload: MemberRoleUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    target_role = payload.role.strip().lower()
+    valid_roles = ["admin", "responder", "viewer"]
+    if target_role not in valid_roles:
+        raise HTTPException(status_code=400, detail=f"Invalid role '{target_role}'. Must be one of: {valid_roles}")
+
+    member_res = await db.execute(
+        select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.id == member_id)
+    )
+    member = member_res.scalars().first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    old_role = member.role
+    member.role = target_role
+    await db.commit()
+    await db.refresh(member)
+    print(f"[AccessManagement] Member {member.email} role updated from '{old_role}' to '{target_role}' for project {project_id}.")
+
+    # Dispatch email notification if role changed
+    email_delivery = None
+    if old_role != target_role:
+        try:
+            proj_res = await db.execute(select(Project).where(Project.id == project_id))
+            project = proj_res.scalar_one_or_none()
+            project_name = project.name if project else "Surveillance Workspace"
+            project_location = project.location if project else "Facility"
+            from email_service import email_service
+            email_delivery = await email_service.send_role_change_email(
+                member_email=member.email,
+                old_role=old_role,
+                new_role=target_role,
+                project_name=project_name,
+                project_location=project_location
+            )
+            print(f"[EmailService] Role change email delivery result for {member.email}: {email_delivery}")
+        except Exception as email_err:
+            print(f"[EmailService] Error dispatching role change email: {email_err}")
+            email_delivery = {"status": "error", "error": str(email_err)}
+
+    return {
+        "message": f"Member role updated to {target_role}",
+        "member": {"id": member.id, "email": member.email, "role": member.role},
+        "email_delivery": email_delivery
+    }
+
+class TestEmailRequest(BaseModel):
+    target_email: Optional[str] = None
+    anomaly_type: Optional[str] = "violence"
+
+@app.get("/api/projects/{project_id}/email-status")
+async def get_project_email_status(project_id: str, db: AsyncSession = Depends(get_db)):
+    """Returns SMTP configuration and list of Access Management recipients who receive incident alerts."""
+    from email_service import email_service
+    status_info = email_service.get_status()
+
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+
+    members_res = await db.execute(select(ProjectMember).where(ProjectMember.project_id == project_id))
+    members = members_res.scalars().all()
+
+    recipients = []
+    if project and project.owner_id and "@" in project.owner_id:
+        recipients.append({"email": project.owner_id, "role": "owner"})
+    for m in members:
+        if m.email and "@" in m.email:
+            recipients.append({"email": m.email, "role": m.role})
+
+    # De-duplicate by email
+    unique_recipients = []
+    seen = set()
+    for r in recipients:
+        if r["email"] not in seen:
+            seen.add(r["email"])
+            unique_recipients.append(r)
+
+    return {
+        "smtp": status_info,
+        "recipients": unique_recipients,
+        "total_recipients": len(unique_recipients)
+    }
+
+@app.post("/api/projects/{project_id}/test-alert-email")
+async def test_alert_email(
+    project_id: str,
+    payload: Optional[TestEmailRequest] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """Dispatches a test alert email with camera, area, and cloud snapshot details to Access Management members."""
+    from email_service import email_service
+
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cam_res = await db.execute(select(Camera).where(Camera.project_id == project_id))
+    camera = cam_res.scalars().first()
+    camera_name = camera.name if camera else "Main Entrance Cam"
+    camera_id = camera.id if camera else "CAM-SEC-01"
+    zone_tag = camera.zone_tag if camera else "Perimeter Area"
+
+    alert_res = await db.execute(
+        select(Alert).where(Alert.project_id == project_id).order_by(Alert.created_at.desc())
+    )
+    latest_alert = alert_res.scalars().first()
+    snapshot_url = latest_alert.snapshot_url if (latest_alert and latest_alert.snapshot_url) else "https://images.unsplash.com/photo-1557597774-9d273605dfa9?w=800"
+
+    anomaly = payload.anomaly_type if (payload and payload.anomaly_type) else "unusual_activity"
+
+    if payload and payload.target_email and payload.target_email.strip():
+        to_emails = [payload.target_email.strip()]
+    else:
+        to_emails = []
+        if project.owner_id and "@" in project.owner_id:
+            to_emails.append(project.owner_id.strip())
+        members_res = await db.execute(select(ProjectMember).where(ProjectMember.project_id == project_id))
+        for m in members_res.scalars().all():
+            if m.email and "@" in m.email:
+                to_emails.append(m.email.strip())
+        to_emails = list(dict.fromkeys(to_emails))
+
+    if not to_emails:
+        raise HTTPException(status_code=400, detail="No email addresses found in Access Management for this project.")
+
+    result = await email_service.send_alert_email(
+        to_emails=to_emails,
+        project_name=project.name,
+        project_location=project.location,
+        camera_name=camera_name,
+        camera_id=camera_id,
+        zone_tag=zone_tag,
+        anomaly_type=anomaly,
+        threat_description=f"Verified {anomaly.replace('_', ' ')} incident in monitored area. Automated dispatch to Access Management roster.",
+        confidence_score=0.96,
+        snapshot_url=snapshot_url,
+        timestamp=datetime.utcnow()
+    )
+
+    return {
+        "status": "success",
+        "result": result,
+        "message": f"Test alert email successfully dispatched to {len(to_emails)} recipient(s): {', '.join(to_emails)}"
+    }
+
 @app.post("/api/projects/{project_id}/cameras")
 async def create_camera(project_id: str, camera_data: CameraCreate, db: AsyncSession = Depends(get_db)):
+    final_zone_tag = camera_data.zone_tag.strip() if camera_data.zone_tag and camera_data.zone_tag.strip() else camera_data.name.strip()
     new_camera = Camera(
         project_id=project_id,
-        name=camera_data.name,
+        name=camera_data.name.strip(),
         source_type="standalone",
-        rtsp_url=camera_data.rtsp_url,
-        zone_tag=camera_data.zone_tag,
+        rtsp_url=camera_data.rtsp_url.strip(),
+        zone_tag=final_zone_tag,
         ai_active=camera_data.ai_active
     )
     db.add(new_camera)
     await db.commit()
     await db.refresh(new_camera)
     
-    # Start stream worker if active
+    # Start stream worker in background thread so HTTP response returns instantly
     if new_camera.ai_active:
         proj_res = await db.execute(select(Project.project_type).where(Project.id == project_id))
         project_type = proj_res.scalar() or "home"
-        stream_mgr.start_camera(
-            camera_id=new_camera.id,
-            camera_name=new_camera.name,
-            rtsp_url=new_camera.rtsp_url,
-            project_id=project_id,
-            project_type=project_type,
-            zone_tag=new_camera.zone_tag or "",
-            on_anomaly_callback=on_anomaly_detected
-        )
+        import threading
+        threading.Thread(
+            target=stream_mgr.start_camera,
+            kwargs={
+                "camera_id": new_camera.id,
+                "camera_name": new_camera.name,
+                "rtsp_url": new_camera.rtsp_url,
+                "project_id": project_id,
+                "project_type": project_type,
+                "zone_tag": new_camera.zone_tag or "",
+                "on_anomaly_callback": on_anomaly_detected
+            },
+            daemon=True
+        ).start()
         
     return {
         "message": "Standalone camera saved successfully",
@@ -681,28 +1242,45 @@ async def update_camera(camera_id: str, payload: CameraUpdate, db: AsyncSession 
     if not camera:
         raise HTTPException(status_code=404, detail="Camera not found")
         
-    camera.name = payload.name
-    camera.rtsp_url = payload.rtsp_url
-    camera.zone_tag = payload.zone_tag
+    old_rtsp_url = camera.rtsp_url
+    final_zone_tag = payload.zone_tag.strip() if payload.zone_tag and payload.zone_tag.strip() else payload.name.strip()
+    
+    camera.name = payload.name.strip()
+    camera.rtsp_url = payload.rtsp_url.strip()
+    camera.zone_tag = final_zone_tag
     camera.nvr_ip_address = payload.nvr_ip_address
     camera.channel_number = payload.channel_number
     
     await db.commit()
     await db.refresh(camera)
     
-    # Restart or stop stream worker
+    # Instant restart or metadata update
     if camera.ai_active:
         proj_res = await db.execute(select(Project.project_type).where(Project.id == camera.project_id))
         project_type = proj_res.scalar() or "home"
-        stream_mgr.start_camera(
-            camera_id=camera.id,
-            camera_name=camera.name,
-            rtsp_url=camera.rtsp_url,
-            project_id=camera.project_id,
-            project_type=project_type,
-            zone_tag=camera.zone_tag or "",
-            on_anomaly_callback=on_anomaly_detected
-        )
+        
+        existing_worker = stream_mgr.get_worker(camera.id)
+        if existing_worker and old_rtsp_url == camera.rtsp_url:
+            # High-speed in-memory update: no need to disconnect/reconnect socket
+            existing_worker.camera_name = camera.name
+            existing_worker.zone_tag = camera.zone_tag or ""
+            print(f"[StreamManager] Updated worker metadata instantly for camera '{camera.name}' without restarting stream.")
+        else:
+            # If stream URL changed, restart in background daemon thread to avoid blocking HTTP response with thread.join()
+            import threading
+            threading.Thread(
+                target=stream_mgr.start_camera,
+                kwargs={
+                    "camera_id": camera.id,
+                    "camera_name": camera.name,
+                    "rtsp_url": camera.rtsp_url,
+                    "project_id": camera.project_id,
+                    "project_type": project_type,
+                    "zone_tag": camera.zone_tag or "",
+                    "on_anomaly_callback": on_anomaly_detected
+                },
+                daemon=True
+            ).start()
     else:
         stream_mgr.stop_camera(camera.id)
         
@@ -715,9 +1293,91 @@ async def update_camera(camera_id: str, payload: CameraUpdate, db: AsyncSession 
             "rtsp_url": camera.rtsp_url,
             "zone_tag": camera.zone_tag,
             "ai_active": camera.ai_active,
+            "allowed_members": camera.allowed_members,
             "nvr_ip_address": camera.nvr_ip_address,
             "channel_number": camera.channel_number
         }
+    }
+
+@app.patch("/api/projects/{project_id}/cameras/access")
+async def update_cameras_access(
+    project_id: str,
+    payload: CameraAccessBatchUpdate,
+    db: AsyncSession = Depends(get_db)
+):
+    if not payload.camera_ids:
+        raise HTTPException(status_code=400, detail="No camera IDs provided")
+
+    # 1. Fetch project info
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+    project_name = project.name if project else "Surveillance Workspace"
+    project_location = project.location if project else "Facility"
+
+    # 2. Fetch all project cameras
+    all_cams_res = await db.execute(select(Camera).where(Camera.project_id == project_id))
+    all_cameras = all_cams_res.scalars().all()
+
+    target_cam_ids = set(payload.camera_ids)
+    target_members = set(m.strip().lower() for m in payload.allowed_members if m and "@" in m)
+    is_open_to_all = "*" in payload.allowed_members or "all" in payload.allowed_members
+    is_admin_only = "admin_only" in payload.allowed_members
+
+    allowed_json = json.dumps(payload.allowed_members)
+
+    for cam in all_cameras:
+        if cam.id in target_cam_ids:
+            cam.allowed_members = allowed_json
+        else:
+            # If specific members were selected for target cameras, ensure they are NOT listed in other cameras
+            if target_members and not is_open_to_all:
+                try:
+                    existing = json.loads(cam.allowed_members) if cam.allowed_members else []
+                    if isinstance(existing, list):
+                        updated_existing = [m for m in existing if m.strip().lower() not in target_members]
+                        cam.allowed_members = json.dumps(updated_existing)
+                except Exception:
+                    pass
+
+    await db.commit()
+
+    print(f"[AccessControl] Updated allowed members for {len(payload.camera_ids)} cameras in project {project_id}: {payload.allowed_members}")
+
+    # 3. Dispatch notification emails to members whose camera access was configured
+    if target_members and not is_open_to_all and not is_admin_only:
+        try:
+            from email_service import email_service
+            fresh_cams_res = await db.execute(select(Camera).where(Camera.project_id == project_id))
+            fresh_cameras = fresh_cams_res.scalars().all()
+
+            for member_email in target_members:
+                granted = []
+                for c in fresh_cameras:
+                    try:
+                        c_allowed = json.loads(c.allowed_members) if c.allowed_members else []
+                        if isinstance(c_allowed, list):
+                            clean = [x.strip().lower() for x in c_allowed]
+                            if member_email in clean or "*" in clean or "all" in clean:
+                                granted.append({"name": c.name, "zone_tag": c.zone_tag or ""})
+                    except Exception:
+                        pass
+
+                if granted:
+                    asyncio.create_task(email_service.send_camera_access_update_email(
+                        member_email=member_email,
+                        project_name=project_name,
+                        project_location=project_location,
+                        granted_cameras=granted,
+                        total_project_cameras=len(fresh_cameras)
+                    ))
+        except Exception as email_err:
+            print(f"[EmailService] Error dispatching camera access email: {email_err}")
+
+    return {
+        "status": "success",
+        "message": f"Updated permissions for {len(payload.camera_ids)} camera(s)",
+        "camera_ids": payload.camera_ids,
+        "allowed_members": payload.allowed_members
     }
 
 @app.put("/api/cameras/{camera_id}/active")
@@ -1349,9 +2009,16 @@ async def verify_threat_in_background(
     snapshot_url = ""
     if verified_successfully and threat_detected:
         if not snapshot_filename:
-            snapshot_filename = f"snap_{uuid.uuid4()}.jpg"
+            snapshot_filename = f"verified_{anomaly_type}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.jpg"
         print(f"[Supabase Storage] Gemini verified threat '{anomaly_type}'. Uploading snapshot in-memory to Supabase Cloud...")
-        cloud_url = await upload_snapshot_to_supabase(project_id, snapshot_filename, image_data)
+        cloud_url = await upload_snapshot_to_supabase(
+            project_id=project_id,
+            filename=snapshot_filename,
+            image_data=image_data,
+            camera_id=camera_id,
+            camera_name=camera_name,
+            anomaly_type=anomaly_type
+        )
         if cloud_url:
             snapshot_url = cloud_url
         else:
@@ -1371,13 +2038,26 @@ async def verify_threat_in_background(
                 confidence_score=confidence_score,
                 anomaly_type=anomaly_type,
                 is_resolved=not threat_detected,  # Automatically resolve if Gemini filters as false positive
-                created_at=datetime.utcnow()
+                created_at=datetime.now(timezone.utc)
             )
             session.add(alert_record)
+
+            if snapshot_url:
+                await session.execute(
+                    update(Camera)
+                    .where(Camera.id == camera_id)
+                    .values(snapshots_captured=Camera.snapshots_captured + 1)
+                )
+                await session.execute(
+                    update(Project)
+                    .where(Project.id == project_id)
+                    .values(snapshots_captured=Project.snapshots_captured + 1)
+                )
+
             await session.commit()
             await session.refresh(alert_record)
             alert_id = alert_record.id
-            print(f"Async threat alert saved successfully to DB (ID: {alert_id})")
+            print(f"Async threat alert saved successfully to DB (ID: {alert_id}, snapshots_captured incremented)")
         except Exception as db_err:
             print(f"Failed to save alert in background thread: {db_err}")
             await session.rollback()

@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { 
-  UserPlus, Bell, Activity, ShieldCheck, X, ShieldAlert, Plus, Radio, ArrowLeft, Video, Trash2,
-  Maximize2, ZoomIn, ZoomOut, RefreshCw, Wifi, WifiOff, Edit
+  Bell, Activity, ShieldCheck, X, ShieldAlert, Plus, Radio, ArrowLeft, Video, Trash2,
+  Maximize2, ZoomIn, ZoomOut, RefreshCw, Wifi, WifiOff, Edit, Loader2
 } from "lucide-react";
 import { getCurrentUser } from "../utils/auth";
 import { getViolenceLevel, getViolenceConfig, type ViolenceFilterType } from "../utils/threatUtils";
@@ -152,6 +152,7 @@ export default function ProjectView() {
   // Edit Camera states
   const [editingCamera, setEditingCamera] = useState<CameraItem | null>(null);
   const [editForm, setEditForm] = useState({ name: "", rtspUrl: "", zoneTag: "" });
+  const [isSavingCamera, setIsSavingCamera] = useState(false);
 
   // Inference Injector controls
   const [showSimPanel, setShowSimPanel] = useState(false);
@@ -292,10 +293,53 @@ export default function ProjectView() {
     const fetchWorkspace = async () => {
       try {
         const response = await fetch(`${API_BASE}/api/projects/${id}`);
-        if (!response.ok) throw new Error("Workspace details unreachable.");
         const data = await response.json();
         setProject(data.project);
-        setCameras(data.cameras);
+
+        // Filter cameras based on user's assigned camera access (Admins see all; Responders & Viewers see permitted feeds)
+        const userEmail = currentUser?.email ? String(currentUser.email).toLowerCase().trim() : "";
+        const memberInfo = (data.members || []).find((m: any) => m.email && String(m.email).toLowerCase().trim() === userEmail);
+        const userRole = memberInfo?.role?.toLowerCase() || (data.project?.owner_id === userEmail ? "admin" : "viewer");
+        const isAdmin = userRole === "admin" || data.project?.owner_id === userEmail;
+
+        const allCams = data.cameras || [];
+        
+        // Check if current user has any specific camera assignments in this project
+        const userHasSpecificCameraAssignments = allCams.some((cam: any) => {
+          if (!cam.allowed_members) return false;
+          try {
+            const allowed = typeof cam.allowed_members === "string" ? JSON.parse(cam.allowed_members) : cam.allowed_members;
+            if (Array.isArray(allowed) && !allowed.includes("*") && !allowed.includes("all") && !allowed.includes("admin_only")) {
+              const clean = allowed.map((a: string) => String(a).toLowerCase().trim());
+              return clean.includes(userEmail);
+            }
+          } catch {}
+          return false;
+        });
+
+        const authorizedCameras = isAdmin ? allCams : allCams.filter((cam: any) => {
+          if (!cam.allowed_members) {
+            return !userHasSpecificCameraAssignments;
+          }
+          try {
+            const allowed = typeof cam.allowed_members === "string" ? JSON.parse(cam.allowed_members) : cam.allowed_members;
+            if (!Array.isArray(allowed) || allowed.length === 0) {
+              return !userHasSpecificCameraAssignments;
+            }
+            if (allowed.includes("admin_only")) {
+              return false;
+            }
+            if (allowed.includes("*") || allowed.includes("all")) {
+              return true;
+            }
+            const cleanAllowed = allowed.map((a: string) => String(a).toLowerCase().trim());
+            return cleanAllowed.includes(userEmail) || cleanAllowed.includes(userRole);
+          } catch {
+            return !userHasSpecificCameraAssignments;
+          }
+        });
+
+        setCameras(authorizedCameras);
         setAlerts(data.alerts);
         
         // Active alerts are only populated via real-time WebSocket events to avoid historical overlays on startup
@@ -1042,16 +1086,21 @@ export default function ProjectView() {
   // Edit Camera API Submit
   const handleEditCameraSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingCamera) return;
+    if (!editingCamera || isSavingCamera) return;
+
+    setIsSavingCamera(true);
+    const targetId = editingCamera.id;
+    const finalName = editForm.name.trim();
+    const finalZoneTag = editForm.zoneTag.trim() || finalName;
 
     try {
-      const response = await fetch(`${API_BASE}/api/cameras/${editingCamera.id}`, {
+      const response = await fetch(`${API_BASE}/api/cameras/${targetId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: editForm.name,
-          rtsp_url: editForm.rtspUrl,
-          zone_tag: editForm.zoneTag,
+          name: finalName,
+          rtsp_url: editForm.rtspUrl.trim(),
+          zone_tag: finalZoneTag,
           nvr_ip_address: editingCamera.nvr_ip_address || null,
           channel_number: editingCamera.channel_number || 1
         }),
@@ -1060,13 +1109,13 @@ export default function ProjectView() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Failed to update camera details.");
 
-      alert("Camera details updated successfully.");
-      
-      // Update local state
-      setCameras(prev => prev.map(c => c.id === editingCamera.id ? { ...c, ...data.camera } : c));
+      // Update local state immediately and close modal seamlessly
+      setCameras(prev => prev.map(c => c.id === targetId ? { ...c, ...data.camera } : c));
       setEditingCamera(null);
     } catch (err: any) {
       alert(err.message || "Failed to update camera details.");
+    } finally {
+      setIsSavingCamera(false);
     }
   };
 
@@ -1543,30 +1592,6 @@ export default function ProjectView() {
                       {!cam.ai_active ? <Wifi size={14} /> : <WifiOff size={14} />}
                     </button>
 
-                    {/* Add Member Button */}
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setShowMemberModal(true);
-                      }}
-                      className="btn-secondary"
-                      style={{
-                        padding: "6px",
-                        background: "rgba(10,5,27,0.85)",
-                        border: "1px solid var(--border-glass)",
-                        borderRadius: "50%",
-                        cursor: "pointer",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        width: "32px",
-                        height: "32px",
-                        boxShadow: "0 2px 10px rgba(0,0,0,0.3)"
-                      }}
-                      title="Add Workspace Member"
-                    >
-                      <UserPlus size={14} color="var(--secondary)" />
-                    </button>
 
                     {/* Edit Camera Button */}
                     <button
@@ -1910,7 +1935,17 @@ export default function ProjectView() {
                 <input
                   type="text"
                   value={editForm.name}
-                  onChange={(e) => setEditForm(prev => ({ ...prev, name: e.target.value }))}
+                  onChange={(e) => {
+                    const newName = e.target.value;
+                    setEditForm(prev => {
+                      const shouldSync = !prev.zoneTag || prev.zoneTag === prev.name || prev.zoneTag.trim() === "";
+                      return {
+                        ...prev,
+                        name: newName,
+                        zoneTag: shouldSync ? newName : prev.zoneTag
+                      };
+                    });
+                  }}
                   placeholder="e.g. Front Door Camera"
                   className="form-input"
                   required
@@ -1933,18 +1968,56 @@ export default function ProjectView() {
               </div>
 
               <div className="form-group">
-                <label className="form-label">Zone Tag</label>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
+                  <label className="form-label" style={{ margin: 0 }}>Zone Tag</label>
+                  <button
+                    type="button"
+                    onClick={() => setEditForm(prev => ({ ...prev, zoneTag: prev.name }))}
+                    style={{
+                      background: "none",
+                      border: "none",
+                      color: "#818cf8",
+                      fontSize: "0.72rem",
+                      cursor: "pointer",
+                      textDecoration: "underline",
+                      padding: 0
+                    }}
+                  >
+                    Sync with Camera Name
+                  </button>
+                </div>
                 <input
                   type="text"
                   value={editForm.zoneTag}
                   onChange={(e) => setEditForm(prev => ({ ...prev, zoneTag: e.target.value }))}
-                  placeholder="e.g. Main Gate, Corridor"
+                  placeholder={editForm.name || "e.g. Main Gate, Corridor"}
                   className="form-input"
                 />
+                <span style={{ fontSize: "0.7rem", color: "var(--text-muted)", marginTop: "4px", display: "block" }}>
+                  Automatically updates with camera name. Can also be customized.
+                </span>
               </div>
 
-              <button type="submit" className="btn-primary" style={{ width: "100%", justifyContent: "center", marginTop: "10px" }}>
-                Save Changes
+              <button 
+                type="submit" 
+                className="btn-primary" 
+                disabled={isSavingCamera}
+                style={{ 
+                  width: "100%", 
+                  justifyContent: "center", 
+                  marginTop: "10px",
+                  opacity: isSavingCamera ? 0.7 : 1,
+                  cursor: isSavingCamera ? "not-allowed" : "pointer"
+                }}
+              >
+                {isSavingCamera ? (
+                  <>
+                    <Loader2 className="pulse-live-icon" style={{ background: "none", boxShadow: "none" }} size={16} />
+                    Saving Changes...
+                  </>
+                ) : (
+                  "Save Changes"
+                )}
               </button>
             </form>
           </div>

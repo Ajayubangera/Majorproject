@@ -95,6 +95,7 @@ class Project(Base):
     location = Column(Text, nullable=False)
     project_type = Column(String(50), nullable=False)
     owner_id = Column(String(255), nullable=False, index=True) # Store user email or sub id
+    snapshots_captured = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     __table_args__ = (
@@ -132,6 +133,8 @@ class Camera(Base):
     rtsp_url = Column(Text, nullable=False)
     zone_tag = Column(String(100), nullable=True)
     ai_active = Column(Boolean, default=True)
+    allowed_members = Column(Text, nullable=True, default="[]")  # JSON list of member emails/roles with view permission
+    snapshots_captured = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
@@ -182,6 +185,45 @@ async def init_db():
                         sync_conn.execute(text("ALTER TABLE alerts ADD COLUMN is_new BOOLEAN DEFAULT TRUE;"))
                     if 'anomaly_type' not in columns:
                         sync_conn.execute(text("ALTER TABLE alerts ADD COLUMN anomaly_type VARCHAR(50);"))
+
+                if 'projects' in tables:
+                    proj_columns = [col['name'] for col in inspector.get_columns('projects')]
+                    if 'snapshots_captured' not in proj_columns:
+                        try:
+                            sync_conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS snapshots_captured INTEGER DEFAULT 0;"))
+                        except Exception:
+                            pass
+                    try:
+                        sync_conn.execute(text("""
+                            UPDATE projects SET snapshots_captured = COALESCE(
+                                (SELECT count(*) FROM alerts WHERE alerts.project_id = projects.id AND alerts.snapshot_url IS NOT NULL AND alerts.snapshot_url != ''), 
+                                0
+                            );
+                        """))
+                    except Exception:
+                        pass
+
+                if 'cameras' in tables:
+                    cam_columns = [col['name'] for col in inspector.get_columns('cameras')]
+                    if 'allowed_members' not in cam_columns:
+                        try:
+                            sync_conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS allowed_members TEXT DEFAULT '[]';"))
+                        except Exception:
+                            pass
+                    if 'snapshots_captured' not in cam_columns:
+                        try:
+                            sync_conn.execute(text("ALTER TABLE cameras ADD COLUMN IF NOT EXISTS snapshots_captured INTEGER DEFAULT 0;"))
+                        except Exception:
+                            pass
+                    try:
+                        sync_conn.execute(text("""
+                            UPDATE cameras SET snapshots_captured = COALESCE(
+                                (SELECT count(*) FROM alerts WHERE alerts.camera_id = cameras.id AND alerts.snapshot_url IS NOT NULL AND alerts.snapshot_url != ''), 
+                                0
+                            );
+                        """))
+                    except Exception:
+                        pass
 
                 # Create performance indexes
                 index_sqls = [

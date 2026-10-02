@@ -22,7 +22,7 @@ import asyncio
 import numpy as np
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # Ensure environment variables are loaded regardless of current working directory
@@ -380,9 +380,16 @@ class VerificationQueueManager:
         snapshot_url = ""
         if threat_detected:
             from main import upload_snapshot_to_supabase
-            filename = task.snapshot_filename or f"snap_{uuid.uuid4()}.jpg"
-            print(f"[Supabase Storage] Verified threat '{task.anomaly_type}'. Uploading snapshot in-memory to cloud...")
-            cloud_url = await upload_snapshot_to_supabase(task.project_id, filename, task.image_data)
+            filename = task.snapshot_filename or f"verified_{task.anomaly_type}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.jpg"
+            print(f"[Supabase Storage] Verified threat '{task.anomaly_type}'. Uploading snapshot in-memory to cloud hierarchy...")
+            cloud_url = await upload_snapshot_to_supabase(
+                project_id=task.project_id,
+                filename=filename,
+                image_data=task.image_data,
+                camera_id=task.camera_id,
+                camera_name=task.camera_name,
+                anomaly_type=task.anomaly_type
+            )
             if cloud_url:
                 snapshot_url = cloud_url
 
@@ -398,16 +405,52 @@ class VerificationQueueManager:
                     confidence_score=confidence_score,
                     anomaly_type=task.anomaly_type,
                     is_resolved=not threat_detected,
-                    created_at=datetime.utcnow()
+                    created_at=datetime.now(timezone.utc)
                 )
                 session.add(alert_record)
+
+                if snapshot_url:
+                    from database import Camera, Project
+                    from sqlalchemy import update
+                    await session.execute(
+                        update(Camera)
+                        .where(Camera.id == task.camera_id)
+                        .values(snapshots_captured=Camera.snapshots_captured + 1)
+                    )
+                    await session.execute(
+                        update(Project)
+                        .where(Project.id == task.project_id)
+                        .values(snapshots_captured=Project.snapshots_captured + 1)
+                    )
+
                 await session.commit()
                 await session.refresh(alert_record)
                 alert_id = alert_record.id
-                print(f"[Database] Alert saved to DB: ID={alert_id}, threat={threat_detected}")
+                print(f"[Database] Alert saved to DB: ID={alert_id}, threat={threat_detected}, snapshots_captured incremented")
             except Exception as db_err:
                 print(f"[Database] Error recording alert: {db_err}")
                 await session.rollback()
+
+        # ─── Access Management Email Alert Dispatch ───────────────────────────
+        email_result = {"status": "skipped", "recipients": []}
+        if threat_detected:
+            try:
+                from email_service import email_service
+                print(f"[Alert Notification] Verified unusual activity '{task.anomaly_type}'. Dispatching email alert to Access Management members...")
+                email_result = await email_service.notify_project_members_of_threat(
+                    project_id=task.project_id,
+                    camera_id=task.camera_id,
+                    camera_name=task.camera_name,
+                    zone_tag=task.camera_zone_tag,
+                    anomaly_type=task.anomaly_type,
+                    threat_description=threat_description,
+                    confidence_score=confidence_score,
+                    snapshot_url=snapshot_url,
+                    image_data=task.image_data,
+                    timestamp=datetime.utcnow()
+                )
+            except Exception as email_err:
+                print(f"[Alert Notification] Error dispatching email alert: {email_err}")
 
         # ─── Real-Time WebSocket Broadcast ───────────────────────────────────
         from main import manager
@@ -424,7 +467,9 @@ class VerificationQueueManager:
                 "snapshot_url": snapshot_url,
                 "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "alert_id": alert_id,
-                "is_resolved": not threat_detected
+                "is_resolved": not threat_detected,
+                "email_status": email_result.get("status"),
+                "email_recipients": email_result.get("recipients", [])
             }
         }
         await manager.broadcast(task.project_id, ws_payload)
