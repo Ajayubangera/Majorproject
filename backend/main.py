@@ -1013,9 +1013,41 @@ async def delete_project_member(project_id: str, member_id: str, db: AsyncSessio
     member = member_res.scalars().first()
     if not member:
         raise HTTPException(status_code=404, detail="Member not found")
+    
+    removed_email = member.email
+    removed_role = member.role
+
+    # Fetch project details for email notification
+    proj_res = await db.execute(select(Project).where(Project.id == project_id))
+    project = proj_res.scalar_one_or_none()
+    project_name = project.name if project else "Surveillance Workspace"
+    project_location = project.location if project else "Facility"
+
     await db.delete(member)
     await db.commit()
-    return {"message": "Member access removed successfully"}
+    print(f"[AccessManagement] Member {removed_email} ({removed_role}) removed from project '{project_name}'.")
+
+    # Dispatch revocation email notification
+    email_delivery = None
+    if removed_email and "@" in removed_email:
+        try:
+            from email_service import email_service
+            email_delivery = await email_service.send_member_removed_email(
+                member_email=removed_email,
+                role=removed_role,
+                project_name=project_name,
+                project_location=project_location
+            )
+            print(f"[EmailService] Member removal email delivery result for {removed_email}: {email_delivery}")
+        except Exception as email_err:
+            print(f"[EmailService] Error dispatching removal email: {email_err}")
+            email_delivery = {"status": "error", "error": str(email_err)}
+
+    return {
+        "message": "Member access removed successfully",
+        "email_delivery": email_delivery,
+        "removed_email": removed_email
+    }
 
 class MemberRoleUpdate(BaseModel):
     role: str = Field(..., description="admin, responder, viewer")

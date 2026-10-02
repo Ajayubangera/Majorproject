@@ -163,6 +163,7 @@ export default function Dashboard() {
   const [emailStatus, setEmailStatus] = useState<any>(null);
   const [testingEmail, setTestingEmail] = useState(false);
   const [updatingMemberId, setUpdatingMemberId] = useState<string | null>(null);
+  const [removingMemberId, setRemovingMemberId] = useState<string | null>(null);
 
   // Delete Project Confirmation Modal State
   const [projectToDelete, setProjectToDelete] = useState<ProjectItem | null>(null);
@@ -441,17 +442,39 @@ export default function Dashboard() {
     }
   };
 
-  const handleRemoveMember = async (memberId: string) => {
+  const handleRemoveMember = async (memberId: string, memberEmail?: string) => {
     if (!activeAccessProject) return;
+    setRemovingMemberId(memberId);
+    setAccessFeedback(null);
     try {
       const response = await fetch(`${API_BASE}/api/projects/${activeAccessProject.id}/members/${memberId}`, {
         method: "DELETE"
       });
+      const data = await response.json().catch(() => ({}));
       if (response.ok) {
         setProjectMembers(prev => prev.filter(m => m.id !== memberId));
+        const emailSent = data.email_delivery?.status === "sent";
+        const emailRecipient = data.removed_email || memberEmail || "member";
+        setAccessFeedback({
+          type: "success",
+          text: emailSent 
+            ? `Member removed. Revocation notification email sent to ${emailRecipient} via Gmail SMTP! (Please check Inbox/Spam)`
+            : `Member removed successfully.`
+        });
+      } else {
+        setAccessFeedback({
+          type: "error",
+          text: data.detail || "Failed to remove member."
+        });
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to remove member:", err);
+      setAccessFeedback({
+        type: "error",
+        text: err.message || "Failed to remove member."
+      });
+    } finally {
+      setRemovingMemberId(null);
     }
   };
 
@@ -2621,7 +2644,8 @@ export default function Dashboard() {
                           </div>
                         </div>
                         <button
-                          onClick={() => handleRemoveMember(member.id)}
+                          onClick={() => handleRemoveMember(member.id, member.email)}
+                          disabled={removingMemberId === member.id}
                           style={{
                             background: "rgba(239, 68, 68, 0.1)",
                             border: "1px solid rgba(239, 68, 68, 0.25)",
@@ -2629,15 +2653,25 @@ export default function Dashboard() {
                             color: "var(--danger)",
                             padding: "4px 8px",
                             fontSize: "0.7rem",
-                            cursor: "pointer",
+                            cursor: removingMemberId === member.id ? "not-allowed" : "pointer",
                             display: "flex",
                             alignItems: "center",
-                            gap: "4px"
+                            gap: "4px",
+                            opacity: removingMemberId === member.id ? 0.6 : 1
                           }}
                           title="Remove Access"
                         >
-                          <Trash2 size={12} />
-                          Remove
+                          {removingMemberId === member.id ? (
+                            <>
+                              <Loader2 size={12} className="animate-spin" />
+                              Removing...
+                            </>
+                          ) : (
+                            <>
+                              <Trash2 size={12} />
+                              Remove
+                            </>
+                          )}
                         </button>
                       </div>
                     ))}

@@ -1144,6 +1144,265 @@ Command Center: {self.app_base_url}/dashboard
                 "subject": content["subject"]
             }
 
+    def build_member_removed_email_content(
+        self,
+        project_name: str,
+        project_location: str,
+        member_email: str,
+        role: str
+    ) -> Dict[str, str]:
+        role_display = role.title() if role else "Member"
+        subject = f"[ACCESS REVOKED] Workspace Access Removed: {project_name}"
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{subject}</title>
+  <style>
+    body {{
+      margin: 0;
+      padding: 0;
+      background-color: #080417;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      color: #e2e8f0;
+    }}
+    .container {{
+      max-width: 600px;
+      margin: 20px auto;
+      background: #0f0a26;
+      border: 1px solid #3b1d36;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+    }}
+    .header {{
+      background: linear-gradient(135deg, #ef4444 0%, #991b1b 100%);
+      padding: 24px;
+      text-align: center;
+    }}
+    .header h1 {{
+      margin: 0;
+      color: #ffffff;
+      font-size: 22px;
+      font-weight: 800;
+      letter-spacing: 0.5px;
+    }}
+    .badge {{
+      display: inline-block;
+      margin-top: 8px;
+      padding: 4px 12px;
+      background: rgba(0, 0, 0, 0.4);
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 700;
+      color: #fecaca;
+    }}
+    .content {{
+      padding: 24px;
+    }}
+    .notice-card {{
+      background: rgba(239, 68, 68, 0.12);
+      border-left: 4px solid #ef4444;
+      padding: 16px;
+      border-radius: 6px;
+      margin-bottom: 24px;
+      font-size: 14px;
+      line-height: 1.5;
+      color: #fca5a5;
+    }}
+    .details-table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 24px;
+      background: rgba(255, 255, 255, 0.02);
+      border-radius: 8px;
+      overflow: hidden;
+      border: 1px solid #23194a;
+    }}
+    .details-table td {{
+      padding: 12px 16px;
+      border-bottom: 1px solid #1f1742;
+      font-size: 13px;
+    }}
+    .details-table tr:last-child td {{
+      border-bottom: none;
+    }}
+    .label {{
+      color: #94a3b8;
+      width: 40%;
+      font-weight: 600;
+    }}
+    .value {{
+      color: #ffffff;
+      font-weight: 500;
+    }}
+    .status-badge {{
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      background: rgba(239, 68, 68, 0.2);
+      color: #f87171;
+      border: 1px solid rgba(239, 68, 68, 0.4);
+    }}
+    .revoked-info-box {{
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid #281d52;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 24px;
+    }}
+    .revoked-info-box h4 {{
+      margin: 0 0 10px 0;
+      color: #e2e8f0;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }}
+    .revoked-info-box ul {{
+      margin: 0;
+      padding-left: 20px;
+      color: #94a3b8;
+      font-size: 12px;
+      line-height: 1.7;
+    }}
+    .footer {{
+      background: #090518;
+      padding: 16px 24px;
+      text-align: center;
+      border-top: 1px solid #1f1742;
+      font-size: 11px;
+      color: #64748b;
+      line-height: 1.6;
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Access Revoked</h1>
+      <div class="badge">Removed by Administrator</div>
+    </div>
+    <div class="content">
+      <div class="notice-card">
+        <strong>Notice:</strong> You were removed from <strong>{project_name}</strong> by an administrator. You no longer have access to this workspace or its live surveillance feeds.
+      </div>
+
+      <table class="details-table">
+        <tr>
+          <td class="label">Member Email</td>
+          <td class="value">{member_email}</td>
+        </tr>
+        <tr>
+          <td class="label">Workspace / Project</td>
+          <td class="value">{project_name} ({project_location})</td>
+        </tr>
+        <tr>
+          <td class="label">Previous Role</td>
+          <td class="value">{role_display}</td>
+        </tr>
+        <tr>
+          <td class="label">Access Status</td>
+          <td class="value"><span class="status-badge">Access Revoked (No Access)</span></td>
+        </tr>
+      </table>
+
+      <div class="revoked-info-box">
+        <h4>🔒 What This Means</h4>
+        <ul>
+          <li>You no longer have permissions to view live CCTV camera streams or project dashboards.</li>
+          <li>You will no longer receive automated security incident or AI threat alert notifications.</li>
+          <li>If you believe this removal was done in error, please reach out to your project administrator.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="footer">
+      AI-Powered Edge CCTV Surveillance & Gemini Verification Platform.<br>
+      This notification was automatically sent to confirm that your workspace access has been removed.
+    </div>
+  </div>
+</body>
+</html>"""
+
+        plain = f"""================================================================================
+WORKSPACE ACCESS REVOKED
+================================================================================
+
+Notice: You were removed from '{project_name}' by an administrator.
+You no longer have access to this project, its surveillance camera streams, or incident alerts.
+
+- Member Email:        {member_email}
+- Workspace / Project: {project_name} ({project_location})
+- Previous Role:       {role_display}
+- Access Status:       Access Revoked (No Access)
+
+What this means:
+- You no longer have permissions to view live CCTV camera streams or project dashboards.
+- You will no longer receive automated security incident or AI threat alert notifications.
+- If you believe this removal was made in error, please reach out to your workspace administrator.
+
+================================================================================
+"""
+        return {"subject": subject, "html": html, "plain": plain}
+
+    async def send_member_removed_email(
+        self,
+        member_email: str,
+        role: str,
+        project_name: str,
+        project_location: str
+    ) -> Dict[str, Any]:
+        """Dispatches an email notification when a member is removed from a workspace."""
+        if not member_email or "@" not in member_email:
+            return {"status": "skipped", "message": "Invalid email"}
+
+        content = self.build_member_removed_email_content(
+            project_name=project_name,
+            project_location=project_location,
+            member_email=member_email,
+            role=role
+        )
+
+        cleaned_emails = [member_email.strip()]
+
+        if self.is_configured:
+            print(f"[EmailService] Dispatching LIVE removal email to {cleaned_emails} via {self.smtp_host}...")
+            success = await asyncio.to_thread(
+                self._send_smtp_sync,
+                cleaned_emails,
+                content["subject"],
+                content["html"],
+                content["plain"],
+                None
+            )
+            return {
+                "status": "sent" if success else "failed",
+                "mode": "live_smtp",
+                "recipients": cleaned_emails,
+                "subject": content["subject"]
+            }
+        else:
+            safe_subject = str(content.get('subject', '')).encode('ascii', 'replace').decode('ascii')
+            print("=" * 80)
+            print("[EmailService SIMULATION] Live SMTP not configured in .env.")
+            print(f"[EmailService SIMULATION] Access Revocation notification dispatched:")
+            print(f"  Recipient:     {cleaned_emails}")
+            print(f"  Subject:       {safe_subject}")
+            print(f"  Previous Role: {role}")
+            print(f"  Project:       {project_name} ({project_location})")
+            print("=" * 80)
+            return {
+                "status": "simulated",
+                "mode": "simulation",
+                "recipients": cleaned_emails,
+                "subject": content["subject"]
+            }
+
     def build_camera_access_email_content(
         self,
         project_name: str,
