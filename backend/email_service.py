@@ -1,6 +1,8 @@
 import os
+import sys
 import smtplib
 import asyncio
+from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
@@ -8,8 +10,27 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
 
+# Ensure backend directory is in sys.path for database imports
+backend_dir = os.path.dirname(os.path.abspath(__file__))
+if backend_dir not in sys.path:
+    sys.path.insert(0, backend_dir)
+
 # Ensure environment variables are loaded
 load_dotenv()
+
+def safe_log(*args, **kwargs):
+    """Safely print messages without failing on Windows console cp1252 / charmap encoding."""
+    try:
+        print(*args, **kwargs)
+    except (UnicodeEncodeError, UnicodeError):
+        clean_args = [
+            str(a).encode("ascii", "replace").decode("ascii") if isinstance(a, str) else a
+            for a in args
+        ]
+        try:
+            print(*clean_args, **kwargs)
+        except Exception:
+            pass
 
 class EmailService:
     """
@@ -28,7 +49,7 @@ class EmailService:
         # Remove spaces in Google App Password (e.g. "daci zuoa pldm hbds" -> "dacizuoapldmhbds")
         self.smtp_password = os.getenv("SMTP_PASSWORD", "").replace(" ", "").strip()
         self.smtp_from_email = os.getenv("SMTP_FROM_EMAIL", "").strip() or self.smtp_user or "alerts@surveillance-ai.com"
-        self.smtp_from_name = os.getenv("SMTP_FROM_NAME", "AI Surveillance Command Center").strip()
+        self.smtp_from_name = os.getenv("SMTP_FROM_NAME", "AI Surveillance Command Center").strip().strip('"').strip("'")
         self.smtp_use_tls = os.getenv("SMTP_USE_TLS", "true").lower() in ("true", "1", "yes")
         self.smtp_use_ssl = os.getenv("SMTP_USE_SSL", "false").lower() in ("true", "1", "yes") or self.smtp_port == 465
         self.app_base_url = os.getenv("APP_BASE_URL", "http://localhost:5173").rstrip("/")
@@ -377,12 +398,12 @@ Please review the surveillance dashboard immediately.
     ) -> bool:
         """Synchronous SMTP worker invoked via asyncio.to_thread."""
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = f"{self.smtp_from_name} <{self.smtp_from_email}>"
+        msg["Subject"] = Header(subject, "utf-8")
+        msg["From"] = f"{Header(self.smtp_from_name, 'utf-8').encode()} <{self.smtp_from_email}>"
         msg["To"] = ", ".join(to_emails)
 
-        msg.attach(MIMEText(plain_content, "plain"))
-        msg.attach(MIMEText(html_content, "html"))
+        msg.attach(MIMEText(plain_content, "plain", "utf-8"))
+        msg.attach(MIMEText(html_content, "html", "utf-8"))
 
         # Optional inline image attachment if available
         if image_data:
@@ -391,7 +412,7 @@ Please review the surveillance dashboard immediately.
                 img_part.add_header("Content-Disposition", "inline", filename="threat_snapshot.jpg")
                 msg.attach(img_part)
             except Exception as img_err:
-                print(f"[EmailService] Notice: Could not attach snapshot bytes: {img_err}")
+                safe_log(f"[EmailService] Notice: Could not attach snapshot bytes: {img_err}")
 
         server = None
         try:
@@ -406,10 +427,10 @@ Please review the surveillance dashboard immediately.
                 server.login(self.smtp_user, self.smtp_password)
 
             server.sendmail(self.smtp_from_email, to_emails, msg.as_string())
-            print(f"[EmailService] Successfully sent security alert email to {len(to_emails)} recipients: {to_emails}")
+            safe_log(f"[EmailService] Successfully sent security alert email to {len(to_emails)} recipients: {to_emails}")
             return True
         except Exception as e:
-            print(f"[EmailService] Failed to send SMTP email to {to_emails}: {e}")
+            safe_log(f"[EmailService] Failed to send SMTP email to {to_emails}: {e}")
             return False
         finally:
             if server:
@@ -439,13 +460,13 @@ Please review the surveillance dashboard immediately.
         If SMTP is not yet configured, cleanly logs and returns simulated delivery status.
         """
         if not to_emails:
-            print("[EmailService] No recipient emails provided. Skipping alert dispatch.")
+            safe_log("[EmailService] No recipient emails provided. Skipping alert dispatch.")
             return {"status": "skipped", "message": "No recipient emails provided", "recipients": []}
 
         # Clean and de-duplicate emails
         cleaned_emails = list(dict.fromkeys([e.strip() for e in to_emails if e and "@" in e]))
         if not cleaned_emails:
-            print("[EmailService] No valid recipient emails found.")
+            safe_log("[EmailService] No valid recipient emails found.")
             return {"status": "skipped", "message": "No valid emails", "recipients": []}
 
         email_data = self.build_email_content(
@@ -462,7 +483,7 @@ Please review the surveillance dashboard immediately.
         )
 
         if self.is_configured:
-            print(f"[EmailService] Dispatching LIVE email to {cleaned_emails} via {self.smtp_host}:{self.smtp_port}...")
+            safe_log(f"[EmailService] Dispatching LIVE email to {cleaned_emails} via {self.smtp_host}:{self.smtp_port}...")
             success = await asyncio.to_thread(
                 self._send_smtp_sync,
                 cleaned_emails,
@@ -480,18 +501,18 @@ Please review the surveillance dashboard immediately.
             }
         else:
             safe_subject = str(email_data.get('subject', '')).encode('ascii', 'replace').decode('ascii')
-            print("=" * 80)
-            print("[EmailService SIMULATION] Live SMTP not configured in .env (SMTP_USER/SMTP_PASSWORD empty).")
-            print("[EmailService SIMULATION] Dispatched alert notification to Access Management members:")
-            print(f"  Recipients:   {cleaned_emails}")
-            print(f"  Subject:      {safe_subject}")
-            print(f"  Camera:       {camera_name} (ID: {camera_id})")
-            print(f"  Area / Zone:  {zone_tag or 'Monitored Zone'}")
-            print(f"  Project:      {project_name} ({project_location})")
-            print(f"  Anomaly:      {anomaly_type} (Confidence: {confidence_score * 100:.1f}%)")
-            print(f"  S3 Snapshot:  {snapshot_url}")
-            print("  To enable real inbox delivery, configure SMTP_USER & SMTP_PASSWORD in .env")
-            print("=" * 80)
+            safe_log("=" * 80)
+            safe_log("[EmailService SIMULATION] Live SMTP not configured in .env (SMTP_USER/SMTP_PASSWORD empty).")
+            safe_log("[EmailService SIMULATION] Dispatched alert notification to Access Management members:")
+            safe_log(f"  Recipients:   {cleaned_emails}")
+            safe_log(f"  Subject:      {safe_subject}")
+            safe_log(f"  Camera:       {camera_name} (ID: {camera_id})")
+            safe_log(f"  Area / Zone:  {zone_tag or 'Monitored Zone'}")
+            safe_log(f"  Project:      {project_name} ({project_location})")
+            safe_log(f"  Anomaly:      {anomaly_type} (Confidence: {confidence_score * 100:.1f}%)")
+            safe_log(f"  S3 Snapshot:  {snapshot_url}")
+            safe_log("  To enable real inbox delivery, configure SMTP_USER & SMTP_PASSWORD in .env")
+            safe_log("=" * 80)
             return {
                 "status": "simulated",
                 "mode": "simulation",
@@ -533,8 +554,18 @@ Please review the surveillance dashboard immediately.
                 if project:
                     project_name = project.name
                     project_location = project.location
-                    if project.owner_id and "@" in project.owner_id:
-                        recipient_emails.append(project.owner_id.strip())
+                    if project.owner_id:
+                        if "@" in project.owner_id:
+                            recipient_emails.append(project.owner_id.strip())
+                        else:
+                            try:
+                                from database import User
+                                u_res = await session.execute(select(User).where(User.id == project.owner_id))
+                                u_obj = u_res.scalar_one_or_none()
+                                if u_obj and u_obj.email and "@" in u_obj.email:
+                                    recipient_emails.append(u_obj.email.strip())
+                            except Exception:
+                                pass
 
                 # Check camera allowed_members if camera_id is provided
                 allowed_camera_members = None
@@ -568,16 +599,22 @@ Please review the surveillance dashboard immediately.
                             recipient_emails.append(m.email.strip())
 
         except Exception as db_err:
-            print(f"[EmailService] Error retrieving project members for alert: {db_err}")
+            safe_log(f"[EmailService] Error retrieving project members for alert: {db_err}")
 
         # De-duplicate
         recipient_emails = list(dict.fromkeys(recipient_emails))
 
         if not recipient_emails:
-            print(f"[EmailService] No member emails found in Access Management for project {project_id}.")
-            return {"status": "skipped", "message": "No Access Management members registered", "recipients": []}
+            # Fallback to configured SMTP email address so threat alerts are never dropped
+            fallback_email = self.smtp_from_email or self.smtp_user
+            if fallback_email and "@" in fallback_email:
+                recipient_emails = [fallback_email]
+                safe_log(f"[EmailService] No member emails found in DB, using fallback alert recipient: {fallback_email}")
+            else:
+                safe_log(f"[EmailService] No member emails found in Access Management for project {project_id}.")
+                return {"status": "skipped", "message": "No Access Management members registered", "recipients": []}
 
-        print(f"[EmailService] Found {len(recipient_emails)} email holder(s) in Access Management for project '{project_name}': {recipient_emails}")
+        safe_log(f"[EmailService] Found {len(recipient_emails)} email holder(s) in Access Management for project '{project_name}': {recipient_emails}")
 
         return await self.send_alert_email(
             to_emails=recipient_emails,
@@ -838,7 +875,7 @@ Command Center: {self.app_base_url}/dashboard
         cleaned_emails = [member_email.strip()]
 
         if self.is_configured:
-            print(f"[EmailService] Dispatching LIVE welcome email to {cleaned_emails} via {self.smtp_host}...")
+            safe_log(f"[EmailService] Dispatching LIVE welcome email to {cleaned_emails} via {self.smtp_host}...")
             success = await asyncio.to_thread(
                 self._send_smtp_sync,
                 cleaned_emails,
@@ -855,15 +892,15 @@ Command Center: {self.app_base_url}/dashboard
             }
         else:
             safe_subject = str(content.get('subject', '')).encode('ascii', 'replace').decode('ascii')
-            print("=" * 80)
-            print("[EmailService SIMULATION] Live SMTP not configured in .env (SMTP_USER empty).")
-            print(f"[EmailService SIMULATION] Access Granted notification dispatched to new member:")
-            print(f"  Recipient:    {cleaned_emails}")
-            print(f"  Subject:      {safe_subject}")
-            print(f"  Role:         {role}")
-            print(f"  Project:      {project_name} ({project_location})")
-            print("  To enable real inbox delivery, configure SMTP_USER & SMTP_PASSWORD in .env")
-            print("=" * 80)
+            safe_log("=" * 80)
+            safe_log("[EmailService SIMULATION] Live SMTP not configured in .env (SMTP_USER empty).")
+            safe_log(f"[EmailService SIMULATION] Access Granted notification dispatched to new member:")
+            safe_log(f"  Recipient:    {cleaned_emails}")
+            safe_log(f"  Subject:      {safe_subject}")
+            safe_log(f"  Role:         {role}")
+            safe_log(f"  Project:      {project_name} ({project_location})")
+            safe_log("  To enable real inbox delivery, configure SMTP_USER & SMTP_PASSWORD in .env")
+            safe_log("=" * 80)
             return {
                 "status": "simulated",
                 "mode": "simulation",
@@ -1112,7 +1149,7 @@ Command Center: {self.app_base_url}/dashboard
         cleaned_emails = [member_email.strip()]
 
         if self.is_configured:
-            print(f"[EmailService] Dispatching LIVE role update email to {cleaned_emails} via {self.smtp_host}...")
+            safe_log(f"[EmailService] Dispatching LIVE role update email to {cleaned_emails} via {self.smtp_host}...")
             success = await asyncio.to_thread(
                 self._send_smtp_sync,
                 cleaned_emails,
@@ -1129,14 +1166,14 @@ Command Center: {self.app_base_url}/dashboard
             }
         else:
             safe_subject = str(content.get('subject', '')).encode('ascii', 'replace').decode('ascii')
-            print("=" * 80)
-            print("[EmailService SIMULATION] Live SMTP not configured in .env.")
-            print(f"[EmailService SIMULATION] Role Change notification dispatched:")
-            print(f"  Recipient:     {cleaned_emails}")
-            print(f"  Subject:       {safe_subject}")
-            print(f"  Role Change:   {old_role} -> {new_role}")
-            print(f"  Project:       {project_name} ({project_location})")
-            print("=" * 80)
+            safe_log("=" * 80)
+            safe_log("[EmailService SIMULATION] Live SMTP not configured in .env.")
+            safe_log(f"[EmailService SIMULATION] Role Change notification dispatched:")
+            safe_log(f"  Recipient:     {cleaned_emails}")
+            safe_log(f"  Subject:       {safe_subject}")
+            safe_log(f"  Role Change:   {old_role} -> {new_role}")
+            safe_log(f"  Project:       {project_name} ({project_location})")
+            safe_log("=" * 80)
             return {
                 "status": "simulated",
                 "mode": "simulation",
@@ -1371,7 +1408,7 @@ What this means:
         cleaned_emails = [member_email.strip()]
 
         if self.is_configured:
-            print(f"[EmailService] Dispatching LIVE removal email to {cleaned_emails} via {self.smtp_host}...")
+            safe_log(f"[EmailService] Dispatching LIVE removal email to {cleaned_emails} via {self.smtp_host}...")
             success = await asyncio.to_thread(
                 self._send_smtp_sync,
                 cleaned_emails,
@@ -1388,14 +1425,14 @@ What this means:
             }
         else:
             safe_subject = str(content.get('subject', '')).encode('ascii', 'replace').decode('ascii')
-            print("=" * 80)
-            print("[EmailService SIMULATION] Live SMTP not configured in .env.")
-            print(f"[EmailService SIMULATION] Access Revocation notification dispatched:")
-            print(f"  Recipient:     {cleaned_emails}")
-            print(f"  Subject:       {safe_subject}")
-            print(f"  Previous Role: {role}")
-            print(f"  Project:       {project_name} ({project_location})")
-            print("=" * 80)
+            safe_log("=" * 80)
+            safe_log("[EmailService SIMULATION] Live SMTP not configured in .env.")
+            safe_log(f"[EmailService SIMULATION] Access Revocation notification dispatched:")
+            safe_log(f"  Recipient:     {cleaned_emails}")
+            safe_log(f"  Subject:       {safe_subject}")
+            safe_log(f"  Previous Role: {role}")
+            safe_log(f"  Project:       {project_name} ({project_location})")
+            safe_log("=" * 80)
             return {
                 "status": "simulated",
                 "mode": "simulation",
@@ -1408,14 +1445,68 @@ What this means:
         project_name: str,
         project_location: str,
         member_email: str,
-        granted_cameras: List[Dict[str, str]],
-        total_project_cameras: int
+        cameras: List[Dict[str, str]],
+        total_project_cameras: int,
+        action: str = "granted"
     ) -> Dict[str, str]:
-        count = len(granted_cameras)
-        subject = f"[ACCESS UPDATE] Camera Access Granted: {count} feed(s) in {project_name}"
+        count = len(cameras)
+        is_revoked = (action == "revoked")
+
+        if is_revoked:
+            if count == 1:
+                cam_name = cameras[0].get("name", "Camera")
+                subject = f"[ACCESS REVOKED] Access Removed for Camera: {cam_name} | {project_name}"
+            elif count >= total_project_cameras:
+                subject = f"[ACCESS REVOKED] Camera Access Revoked for All Feeds | {project_name}"
+            else:
+                subject = f"[ACCESS REVOKED] Access Removed for {count} Camera(s) | {project_name}"
+
+            header_gradient = "linear-gradient(135deg, #e11d48 0%, #991b1b 100%)"
+            badge_text = "Camera Permission Revoked"
+            badge_bg = "rgba(225, 29, 72, 0.2)"
+            badge_color = "#fecdd3"
+            notice_bg = "rgba(225, 29, 72, 0.12)"
+            notice_border = "#e11d48"
+            notice_color = "#fecdd3"
+            notice_headline = "Camera Access Revoked"
+            notice_msg = f"Your viewing and monitoring access for the camera feed(s) listed below in <strong>{project_name}</strong> ({project_location}) has been revoked by an administrator."
+            status_pill_bg = "rgba(239, 68, 68, 0.15)"
+            status_pill_border = "rgba(239, 68, 68, 0.3)"
+            status_pill_color = "#ef4444"
+            status_pill_text = "ACCESS REVOKED"
+            scope_bg = "rgba(239, 68, 68, 0.08)"
+            scope_border = "rgba(239, 68, 68, 0.25)"
+            scope_color = "#fca5a5"
+            scope_msg = f"<strong>ℹ️ Scope Notice:</strong> You will no longer receive threat alerts or live video feeds from the camera(s) listed below. Your existing access to any other authorized cameras across <strong>{project_name}</strong> remains completely active and unaffected."
+        else:
+            if count == 1:
+                cam_name = cameras[0].get("name", "Camera")
+                subject = f"[ACCESS GRANTED] Access Granted to Camera: {cam_name} | {project_name}"
+            elif count >= total_project_cameras:
+                subject = f"[ACCESS GRANTED] Access Granted to All Cameras ({count} feeds) | {project_name}"
+            else:
+                subject = f"[ACCESS GRANTED] Access Granted to {count} Camera(s) | {project_name}"
+
+            header_gradient = "linear-gradient(135deg, #0284c7 0%, #6366f1 100%)"
+            badge_text = "Camera Access Assigned"
+            badge_bg = "rgba(0, 0, 0, 0.35)"
+            badge_color = "#bae6fd"
+            notice_bg = "rgba(2, 132, 199, 0.12)"
+            notice_border = "#0284c7"
+            notice_color = "#bae6fd"
+            notice_headline = "Camera Access Granted"
+            notice_msg = f"You have been granted viewing and monitoring access to the camera feed(s) listed below in <strong>{project_name}</strong> ({project_location}) by an administrator."
+            status_pill_bg = "rgba(16, 185, 129, 0.15)"
+            status_pill_border = "rgba(16, 185, 129, 0.3)"
+            status_pill_color = "#10b981"
+            status_pill_text = "ACTIVE ACCESS"
+            scope_bg = "rgba(16, 185, 129, 0.08)"
+            scope_border = "rgba(16, 185, 129, 0.25)"
+            scope_color = "#a7f3d0"
+            scope_msg = f"<strong>🔒 Scope Notice:</strong> You are authorized to monitor the active stream(s) listed below. Your existing permissions on other cameras in this facility remain intact."
 
         camera_rows_html = ""
-        for idx, cam in enumerate(granted_cameras, 1):
+        for idx, cam in enumerate(cameras, 1):
             cam_name = cam.get("name", f"Camera {idx}")
             cam_zone = cam.get("zone_tag") or "General Area"
             camera_rows_html += f"""
@@ -1427,18 +1518,19 @@ What this means:
                 📍 {cam_zone}
               </td>
               <td style="padding: 12px 14px; border-bottom: 1px solid #1f1742; text-align: right;">
-                <span style="background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700;">
-                  ACTIVE ACCESS
+                <span style="background: {status_pill_bg}; color: {status_pill_color}; border: 1px solid {status_pill_border}; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700;">
+                  {status_pill_text}
                 </span>
               </td>
             </tr>
             """
 
         camera_rows_plain = ""
-        for idx, cam in enumerate(granted_cameras, 1):
+        for idx, cam in enumerate(cameras, 1):
             cam_name = cam.get("name", f"Camera {idx}")
             cam_zone = cam.get("zone_tag") or "General Area"
-            camera_rows_plain += f"  - Camera {idx}: {cam_name} (Zone: {cam_zone}) [AUTHORIZED]\n"
+            action_tag = "[ACCESS REVOKED]" if is_revoked else "[AUTHORIZED]"
+            camera_rows_plain += f"  - Camera {idx}: {cam_name} (Zone: {cam_zone}) {action_tag}\n"
 
         html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1464,7 +1556,7 @@ What this means:
       box-shadow: 0 10px 30px rgba(0,0,0,0.6);
     }}
     .header {{
-      background: linear-gradient(135deg, #0284c7 0%, #6366f1 100%);
+      background: {header_gradient};
       padding: 24px;
       text-align: center;
     }}
@@ -1479,33 +1571,33 @@ What this means:
       display: inline-block;
       margin-top: 8px;
       padding: 4px 12px;
-      background: rgba(0, 0, 0, 0.35);
+      background: {badge_bg};
       border-radius: 20px;
       font-size: 12px;
       font-weight: 700;
-      color: #bae6fd;
+      color: {badge_color};
     }}
     .content {{
       padding: 24px;
     }}
     .notice-card {{
-      background: rgba(2, 132, 199, 0.12);
-      border-left: 4px solid #0284c7;
+      background: {notice_bg};
+      border-left: 4px solid {notice_border};
       padding: 16px;
       border-radius: 6px;
       margin-bottom: 24px;
       font-size: 14px;
       line-height: 1.5;
-      color: #bae6fd;
+      color: {notice_color};
     }}
     .scope-box {{
-      background: rgba(245, 158, 11, 0.1);
-      border: 1px solid rgba(245, 158, 11, 0.3);
+      background: {scope_bg};
+      border: 1px solid {scope_border};
       border-radius: 8px;
       padding: 14px 16px;
       margin-bottom: 24px;
       font-size: 13px;
-      color: #fef3c7;
+      color: {scope_color};
       line-height: 1.5;
     }}
     .cameras-table {{
@@ -1556,16 +1648,16 @@ What this means:
 <body>
   <div class="container">
     <div class="header">
-      <h1>Camera Access Permissions</h1>
-      <div class="badge">Workspace Surveillance Management</div>
+      <h1>{notice_headline}</h1>
+      <div class="badge">{badge_text}</div>
     </div>
     <div class="content">
       <div class="notice-card">
-        <strong>Notice:</strong> Your camera viewing and threat monitoring permissions for <strong>{project_name}</strong> ({project_location}) have been updated by an administrator.
+        {notice_msg}
       </div>
 
       <div class="scope-box">
-        <strong>🔒 Exclusive Access Scope:</strong> You have been granted access to only the <strong>{count}</strong> selected camera feed(s) listed below. Access to all other camera feeds in this workspace has been restricted.
+        {scope_msg}
       </div>
 
       <table class="cameras-table">
@@ -1573,7 +1665,7 @@ What this means:
           <tr>
             <th>Camera Feed</th>
             <th>Zone / Location</th>
-            <th style="text-align: right;">Access Status</th>
+            <th style="text-align: right;">Permission Status</th>
           </tr>
         </thead>
         <tbody>
@@ -1593,7 +1685,7 @@ What this means:
 
     <div class="footer">
       AI-Powered Edge CCTV Surveillance & Gemini Verification Platform.<br>
-      This notice was automatically dispatched to confirm your assigned camera feed access.
+      This notice was automatically dispatched to confirm camera access configuration.
     </div>
   </div>
 </body>
@@ -1603,16 +1695,15 @@ What this means:
 WORKSPACE CAMERA ACCESS PERMISSION UPDATE
 ================================================================================
 
-Your camera viewing and monitoring access for {project_name} ({project_location})
-has been updated by an administrator.
+Workspace: {project_name} ({project_location})
+Recipient: {member_email}
+Action:    {badge_text}
 
-MEMBER EMAIL: {member_email}
-
-AUTHORIZED CAMERA FEEDS ({count}):
+AFFECTED CAMERA FEEDS ({count}):
 {camera_rows_plain}
-ACCESS SCOPE NOTICE:
-You have been granted access to ONLY the {count} selected camera feed(s) listed above.
-Access to all other camera feeds in this facility has been restricted.
+
+SCOPE NOTICE:
+{"Access to the above camera feed(s) has been REVOKED. Other cameras remain unaffected." if is_revoked else f"Access granted to the above camera feed(s)."}
 
 To view your authorized live streams and monitored alerts, log in to your dashboard:
 {self.app_base_url}/dashboard
@@ -1625,25 +1716,32 @@ To view your authorized live streams and monitored alerts, log in to your dashbo
         member_email: str,
         project_name: str,
         project_location: str,
-        granted_cameras: List[Dict[str, str]],
-        total_project_cameras: int
+        cameras: Optional[List[Dict[str, str]]] = None,
+        total_project_cameras: int = 1,
+        action: str = "granted",
+        granted_cameras: Optional[List[Dict[str, str]]] = None
     ) -> Dict[str, Any]:
-        """Dispatches an email notification when camera access permissions are specifically assigned to a member."""
+        """Dispatches an email notification when camera access permissions are specifically updated (granted or revoked)."""
         if not member_email or "@" not in member_email:
             return {"status": "skipped", "message": "Invalid email"}
+
+        active_cameras = cameras if cameras is not None else (granted_cameras or [])
+        if not active_cameras:
+            return {"status": "skipped", "message": "No cameras provided"}
 
         content = self.build_camera_access_email_content(
             project_name=project_name,
             project_location=project_location,
             member_email=member_email,
-            granted_cameras=granted_cameras,
-            total_project_cameras=total_project_cameras
+            cameras=active_cameras,
+            total_project_cameras=total_project_cameras,
+            action=action
         )
 
         cleaned_emails = [member_email.strip()]
 
         if self.is_configured:
-            print(f"[EmailService] Dispatching LIVE camera access email to {cleaned_emails} via {self.smtp_host}...")
+            safe_log(f"[EmailService] Dispatching LIVE camera access ({action}) email to {cleaned_emails} via {self.smtp_host}...")
             success = await asyncio.to_thread(
                 self._send_smtp_sync,
                 cleaned_emails,
@@ -1660,14 +1758,14 @@ To view your authorized live streams and monitored alerts, log in to your dashbo
             }
         else:
             safe_subject = str(content.get('subject', '')).encode('ascii', 'replace').decode('ascii')
-            print("=" * 80)
-            print("[EmailService SIMULATION] Live SMTP not configured in .env.")
-            print(f"[EmailService SIMULATION] Camera Access notification dispatched:")
-            print(f"  Recipient:       {cleaned_emails}")
-            print(f"  Subject:         {safe_subject}")
-            print(f"  Granted Cameras: {[c.get('name') for c in granted_cameras]}")
-            print(f"  Project:         {project_name} ({project_location})")
-            print("=" * 80)
+            safe_log("=" * 80)
+            safe_log("[EmailService SIMULATION] Live SMTP not configured in .env.")
+            safe_log(f"[EmailService SIMULATION] Camera Access ({action.upper()}) notification dispatched:")
+            safe_log(f"  Recipient:       {cleaned_emails}")
+            safe_log(f"  Subject:         {safe_subject}")
+            safe_log(f"  Affected Cams:   {[c.get('name') for c in active_cameras]}")
+            safe_log(f"  Project:         {project_name} ({project_location})")
+            safe_log("=" * 80)
             return {
                 "status": "simulated",
                 "mode": "simulation",
@@ -1940,7 +2038,7 @@ Launch Command Center: {self.app_base_url}/dashboard
         cleaned_emails = [email.strip()]
 
         if self.is_configured:
-            print(f"[EmailService] Dispatching LIVE registration welcome email to {cleaned_emails} via {self.smtp_host}...")
+            safe_log(f"[EmailService] Dispatching LIVE registration welcome email to {cleaned_emails} via {self.smtp_host}...")
             success = await asyncio.to_thread(
                 self._send_smtp_sync,
                 cleaned_emails,
@@ -1957,13 +2055,13 @@ Launch Command Center: {self.app_base_url}/dashboard
             }
         else:
             safe_subject = str(content.get('subject', '')).encode('ascii', 'replace').decode('ascii')
-            print("=" * 80)
-            print("[EmailService SIMULATION] Live SMTP not configured in .env.")
-            print(f"[EmailService SIMULATION] Account Registration Welcome dispatched:")
-            print(f"  Recipient:    {cleaned_emails}")
-            print(f"  Subject:      {safe_subject}")
-            print(f"  Account User: {full_name} ({organization_name})")
-            print("=" * 80)
+            safe_log("=" * 80)
+            safe_log("[EmailService SIMULATION] Live SMTP not configured in .env.")
+            safe_log(f"[EmailService SIMULATION] Account Registration Welcome dispatched:")
+            safe_log(f"  Recipient:    {cleaned_emails}")
+            safe_log(f"  Subject:      {safe_subject}")
+            safe_log(f"  Account User: {full_name} ({organization_name})")
+            safe_log("=" * 80)
             return {
                 "status": "simulated",
                 "mode": "simulation",
@@ -2214,7 +2312,7 @@ Your current password remains unchanged.
         cleaned_emails = [email.strip()]
 
         if self.is_configured:
-            print(f"[EmailService] Dispatching LIVE password reset email to {cleaned_emails} via {self.smtp_host}...")
+            safe_log(f"[EmailService] Dispatching LIVE password reset email to {cleaned_emails} via {self.smtp_host}...")
             success = await asyncio.to_thread(
                 self._send_smtp_sync,
                 cleaned_emails,
@@ -2231,13 +2329,13 @@ Your current password remains unchanged.
             }
         else:
             safe_subject = str(content.get('subject', '')).encode('ascii', 'replace').decode('ascii')
-            print("=" * 80)
-            print("[EmailService SIMULATION] Live SMTP not configured in .env.")
-            print(f"[EmailService SIMULATION] Password Reset Email dispatched:")
-            print(f"  Recipient: {cleaned_emails}")
-            print(f"  Subject:   {safe_subject}")
-            print(f"  Reset URL: {reset_url}")
-            print("=" * 80)
+            safe_log("=" * 80)
+            safe_log("[EmailService SIMULATION] Live SMTP not configured in .env.")
+            safe_log(f"[EmailService SIMULATION] Password Reset Email dispatched:")
+            safe_log(f"  Recipient: {cleaned_emails}")
+            safe_log(f"  Subject:   {safe_subject}")
+            safe_log(f"  Reset URL: {reset_url}")
+            safe_log("=" * 80)
             return {
                 "status": "simulated",
                 "mode": "simulation",

@@ -99,6 +99,21 @@ export default function ProjectSetup() {
     }
   };
 
+  const isMemberAllowedForCamera = (memberEmail: string, cam: CameraItem): boolean => {
+    const allowed = parseAllowedMembers(cam.allowed_members);
+    if (allowed.length === 0 || allowed.includes("*") || allowed.includes("all")) {
+      return true;
+    }
+    if (allowed.includes("admin_only")) {
+      return false;
+    }
+    return allowed.some(a => a.trim().toLowerCase() === memberEmail.trim().toLowerCase());
+  };
+
+  const getMemberAccessibleCameras = (memberEmail: string): CameraItem[] => {
+    return cameras.filter(c => isMemberAllowedForCamera(memberEmail, c));
+  };
+
   const handleToggleCameraSelect = (camId: string) => {
     setSelectedCameraIds(prev => 
       prev.includes(camId) ? prev.filter(c => c !== camId) : [...prev, camId]
@@ -135,8 +150,11 @@ export default function ProjectSetup() {
         );
       }
     } else {
-      // Multiple cameras selected: start with all viewers & responders selected
-      setSelectedMemberEmailsForAccess(nonAdminMembers.map(m => m.email));
+      // Multiple cameras selected: members who currently have access to all target cameras
+      const allowedInAll = nonAdminMembers
+        .filter(m => targetCams.every(c => isMemberAllowedForCamera(m.email, c)))
+        .map(m => m.email);
+      setSelectedMemberEmailsForAccess(allowedInAll);
     }
 
     setShowCameraAccessModal(true);
@@ -513,8 +531,9 @@ export default function ProjectSetup() {
         throw new Error(data.detail || "Could not invite member.");
       }
 
-      setMembers((prev) => [...prev, { id: Math.random().toString(), email: inviteEmail, role: inviteRole }]);
+      setMembers((prev) => [...prev, { id: data.member?.id || Math.random().toString(), email: inviteEmail, role: inviteRole }]);
       setInviteEmail("");
+      loadCameras();
     } catch (err: any) {
       alert(err.message);
     } finally {
@@ -1601,6 +1620,7 @@ export default function ProjectSetup() {
                 return nonAdminMembers.map((m) => {
                   const isChecked = selectedMemberEmailsForAccess.includes(m.email);
                   const isResponder = m.role?.toLowerCase() === "responder";
+                  const accessibleCams = getMemberAccessibleCameras(m.email);
 
                   return (
                     <label
@@ -1633,11 +1653,49 @@ export default function ProjectSetup() {
                           <div style={{ fontSize: "0.84rem", color: "#f8fafc", fontWeight: 600 }}>
                             {m.email}
                           </div>
-                          <span style={{ fontSize: "0.7rem", color: isResponder ? "var(--warning)" : "#c084fc" }}>
+                          <span style={{ fontSize: "0.7rem", color: isResponder ? "var(--warning)" : "#c084fc", display: "block" }}>
                             {isResponder 
                               ? "⚡ Incident Responder (Receives AI Threat Alerts & Live Stream)" 
                               : "👁️ Feed Viewer (Read-only Live Stream)"}
                           </span>
+                          <div style={{
+                            marginTop: "4px",
+                            fontSize: "0.69rem",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "5px",
+                            flexWrap: "wrap",
+                            lineHeight: 1.4
+                          }}>
+                            <span style={{ color: "#94a3b8", fontWeight: 600 }}>Cameras accessed:</span>
+                            {cameras.length === 0 ? (
+                              <span style={{ color: "var(--text-muted)", fontStyle: "italic" }}>No cameras configured</span>
+                            ) : accessibleCams.length === 0 ? (
+                              <span style={{
+                                background: "rgba(239, 68, 68, 0.12)",
+                                color: "#f87171",
+                                border: "1px solid rgba(239, 68, 68, 0.25)",
+                                padding: "1px 6px",
+                                borderRadius: "3px",
+                                fontSize: "0.66rem",
+                                fontWeight: 600
+                              }}>
+                                🔒 None (Restricted)
+                              </span>
+                            ) : (
+                              <span style={{
+                                background: accessibleCams.length === cameras.length ? "rgba(16, 185, 129, 0.12)" : "rgba(56, 189, 248, 0.12)",
+                                color: accessibleCams.length === cameras.length ? "#34d399" : "#38bdf8",
+                                border: `1px solid ${accessibleCams.length === cameras.length ? "rgba(16, 185, 129, 0.25)" : "rgba(56, 189, 248, 0.25)"}`,
+                                padding: "1px 6px",
+                                borderRadius: "3px",
+                                fontSize: "0.66rem",
+                                fontWeight: 600
+                              }}>
+                                📹 {accessibleCams.map(c => c.name).join(", ")} {accessibleCams.length === cameras.length ? "(All Feeds)" : `(${accessibleCams.length}/${cameras.length})`}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
 

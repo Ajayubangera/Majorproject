@@ -984,6 +984,26 @@ async def add_project_member(project_id: str, invite: ProjectMemberInvite, db: A
         role=invite.role
     )
     db.add(new_member)
+
+    # Initial camera access: A newly added member gets initial access to all cameras in this project
+    cams_res = await db.execute(select(Camera).where(Camera.project_id == project_id))
+    project_cameras = cams_res.scalars().all()
+    clean_invite_email = invite.email.strip().lower()
+
+    for cam in project_cameras:
+        if cam.allowed_members:
+            try:
+                parsed = json.loads(cam.allowed_members) if isinstance(cam.allowed_members, str) else cam.allowed_members
+                # If camera has a specific list of members, add the new member so they have initial access
+                if isinstance(parsed, list) and len(parsed) > 0 and "*" not in parsed and "all" not in parsed:
+                    if "admin_only" not in parsed:
+                        clean_list = [str(x).strip().lower() for x in parsed]
+                        if clean_invite_email not in clean_list:
+                            parsed.append(invite.email.strip())
+                            cam.allowed_members = json.dumps(parsed)
+            except Exception:
+                pass
+
     await db.commit()
     await db.refresh(new_member)
 
@@ -1173,13 +1193,25 @@ async def test_alert_email(
         to_emails = [payload.target_email.strip()]
     else:
         to_emails = []
-        if project.owner_id and "@" in project.owner_id:
-            to_emails.append(project.owner_id.strip())
+        if project.owner_id:
+            if "@" in project.owner_id:
+                to_emails.append(project.owner_id.strip())
+            else:
+                from database import User
+                u_res = await db.execute(select(User).where(User.id == project.owner_id))
+                u = u_res.scalar_one_or_none()
+                if u and u.email and "@" in u.email:
+                    to_emails.append(u.email.strip())
         members_res = await db.execute(select(ProjectMember).where(ProjectMember.project_id == project_id))
         for m in members_res.scalars().all():
             if m.email and "@" in m.email:
                 to_emails.append(m.email.strip())
         to_emails = list(dict.fromkeys(to_emails))
+
+        if not to_emails:
+            fallback = email_service.smtp_from_email or email_service.smtp_user
+            if fallback and "@" in fallback:
+                to_emails = [fallback]
 
     if not to_emails:
         raise HTTPException(status_code=400, detail="No email addresses found in Access Management for this project.")
@@ -1350,60 +1382,98 @@ async def update_cameras_access(
     all_cams_res = await db.execute(select(Camera).where(Camera.project_id == project_id))
     all_cameras = all_cams_res.scalars().all()
 
+    # Fetch non-admin project members to track permissions
+    members_res = await db.execute(select(ProjectMember).where(ProjectMember.project_id == project_id))
+    project_members = members_res.scalars().all()
+    non_admin_members = [m for m in project_members if (m.role or "").lower() != "admin"]
+
     target_cam_ids = set(payload.camera_ids)
-    target_members = set(m.strip().lower() for m in payload.allowed_members if m and "@" in m)
-    is_open_to_all = "*" in payload.allowed_members or "all" in payload.allowed_members
-    is_admin_only = "admin_only" in payload.allowed_members
+    target_cameras = [c for c in all_cameras if c.id in target_cam_ids]
+    if not target_cameras:
+        raise HTTPException(status_code=404, detail="Target cameras not found in project")
 
+    # Helper function to check member access on a camera
+    def has_camera_access(email: str, allowed_raw) -> bool:
+        if not email:
+            return False
+        clean_email = email.strip().lower()
+        if not allowed_raw:
+            return True  # default: open to all workspace viewers and responders
+        try:
+            allowed = json.loads(allowed_raw) if isinstance(allowed_raw, str) else allowed_raw
+            if not isinstance(allowed, list) or len(allowed) == 0:
+                return True
+            allowed_clean = [str(x).strip().lower() for x in allowed]
+            if "admin_only" in allowed_clean:
+                return False
+            if "*" in allowed_clean or "all" in allowed_clean:
+                return True
+            return clean_email in allowed_clean
+        except Exception:
+            return True
+
+    # 3. Snapshot prior access state for target cameras before applying changes
+    prior_access = {}
+    for m in non_admin_members:
+        m_email = m.email.strip().lower()
+        prior_access[m_email] = {
+            cam.id: has_camera_access(m_email, cam.allowed_members)
+            for cam in target_cameras
+        }
+
+    # 4. Update ONLY the target cameras (non-target cameras remain completely untouched)
     allowed_json = json.dumps(payload.allowed_members)
-
-    for cam in all_cameras:
-        if cam.id in target_cam_ids:
-            cam.allowed_members = allowed_json
-        else:
-            # If specific members were selected for target cameras, ensure they are NOT listed in other cameras
-            if target_members and not is_open_to_all:
-                try:
-                    existing = json.loads(cam.allowed_members) if cam.allowed_members else []
-                    if isinstance(existing, list):
-                        updated_existing = [m for m in existing if m.strip().lower() not in target_members]
-                        cam.allowed_members = json.dumps(updated_existing)
-                except Exception:
-                    pass
+    for cam in target_cameras:
+        cam.allowed_members = allowed_json
 
     await db.commit()
+    print(f"[AccessControl] Updated allowed members for {len(target_cameras)} cameras in project {project_id}: {payload.allowed_members}")
 
-    print(f"[AccessControl] Updated allowed members for {len(payload.camera_ids)} cameras in project {project_id}: {payload.allowed_members}")
+    # 5. Dispatch respective email notifications (granted vs revoked)
+    from email_service import email_service
+    total_cameras_count = len(all_cameras)
 
-    # 3. Dispatch notification emails to members whose camera access was configured
-    if target_members and not is_open_to_all and not is_admin_only:
-        try:
-            from email_service import email_service
-            fresh_cams_res = await db.execute(select(Camera).where(Camera.project_id == project_id))
-            fresh_cameras = fresh_cams_res.scalars().all()
+    for m in non_admin_members:
+        m_email = m.email.strip().lower()
+        new_access = has_camera_access(m_email, payload.allowed_members)
 
-            for member_email in target_members:
-                granted = []
-                for c in fresh_cameras:
-                    try:
-                        c_allowed = json.loads(c.allowed_members) if c.allowed_members else []
-                        if isinstance(c_allowed, list):
-                            clean = [x.strip().lower() for x in c_allowed]
-                            if member_email in clean or "*" in clean or "all" in clean:
-                                granted.append({"name": c.name, "zone_tag": c.zone_tag or ""})
-                    except Exception:
-                        pass
+        granted_cams = []
+        revoked_cams = []
 
-                if granted:
-                    asyncio.create_task(email_service.send_camera_access_update_email(
-                        member_email=member_email,
-                        project_name=project_name,
-                        project_location=project_location,
-                        granted_cameras=granted,
-                        total_project_cameras=len(fresh_cameras)
-                    ))
-        except Exception as email_err:
-            print(f"[EmailService] Error dispatching camera access email: {email_err}")
+        for cam in target_cameras:
+            had_access = prior_access.get(m_email, {}).get(cam.id, False)
+            cam_info = {"name": cam.name, "zone_tag": cam.zone_tag or ""}
+
+            if not had_access and new_access:
+                granted_cams.append(cam_info)
+            elif had_access and not new_access:
+                revoked_cams.append(cam_info)
+
+        if granted_cams:
+            try:
+                asyncio.create_task(email_service.send_camera_access_update_email(
+                    member_email=m.email,
+                    project_name=project_name,
+                    project_location=project_location,
+                    cameras=granted_cams,
+                    total_project_cameras=total_cameras_count,
+                    action="granted"
+                ))
+            except Exception as e:
+                print(f"[EmailService] Failed to dispatch granted email for {m.email}: {e}")
+
+        if revoked_cams:
+            try:
+                asyncio.create_task(email_service.send_camera_access_update_email(
+                    member_email=m.email,
+                    project_name=project_name,
+                    project_location=project_location,
+                    cameras=revoked_cams,
+                    total_project_cameras=total_cameras_count,
+                    action="revoked"
+                ))
+            except Exception as e:
+                print(f"[EmailService] Failed to dispatch revoked email for {m.email}: {e}")
 
     return {
         "status": "success",
@@ -2164,9 +2234,11 @@ async def trigger_yolo_detection(
             if fetched:
                 image_data = fetched
                 print("Successfully fetched live frame directly from camera stream source (in-memory).")
-            else:
+            elif not payload.anomaly_type:
                 print(f"Bypassing detection for camera {camera.id}: no active stream signal.")
                 return {"message": "Detection bypassed: camera has no signal.", "threat_detected": False}
+            else:
+                print(f"Camera {camera.id} offline, but explicit anomaly '{payload.anomaly_type}' requested. Proceeding with fallback payload.")
 
     # Final fallback to black jpeg if still empty (in-memory)
     if not image_data:

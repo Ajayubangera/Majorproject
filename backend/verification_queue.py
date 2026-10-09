@@ -22,8 +22,14 @@ import asyncio
 import numpy as np
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
+import sys
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+
+# Ensure backend directory is in sys.path
+backend_dir = os.path.dirname(os.path.abspath(__file__))
+if backend_dir not in sys.path:
+    sys.path.insert(0, backend_dir)
 
 # Ensure environment variables are loaded regardless of current working directory
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
