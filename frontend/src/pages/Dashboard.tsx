@@ -3,7 +3,7 @@ import { useNavigate, Link } from "react-router-dom";
 import { 
   Plus, Video, ShieldAlert, Folder, MapPin, LogOut, UserCheck, Bell, X, Clock, AlertTriangle,
   Maximize2, Minimize2, ZoomIn, ZoomOut, RefreshCw, Trash2, RotateCcw, Users, UserPlus, Check,
-  Mail, Send, Download, Loader2
+  Download, Loader2
 } from "lucide-react";
 import { getCurrentUser, clearSession } from "../utils/auth";
 import { getViolenceLevel, getViolenceConfig, type ViolenceFilterType } from "../utils/threatUtils";
@@ -160,8 +160,6 @@ export default function Dashboard() {
   const [inviteRole, setInviteRole] = useState("responder");
   const [inviteLoading, setInviteLoading] = useState(false);
   const [accessFeedback, setAccessFeedback] = useState<{ type: "success" | "error"; text: string } | null>(null);
-  const [emailStatus, setEmailStatus] = useState<any>(null);
-  const [testingEmail, setTestingEmail] = useState(false);
   const [updatingMemberId, setUpdatingMemberId] = useState<string | null>(null);
   const [removingMemberId, setRemovingMemberId] = useState<string | null>(null);
 
@@ -359,50 +357,15 @@ export default function Dashboard() {
     setAccessFeedback(null);
     setLoadingMembers(true);
     try {
-      const [membersRes, emailRes] = await Promise.all([
-        fetch(`${API_BASE}/api/projects/${project.id}/members`),
-        fetch(`${API_BASE}/api/projects/${project.id}/email-status`).catch(() => null)
-      ]);
+      const membersRes = await fetch(`${API_BASE}/api/projects/${project.id}/members`);
       if (membersRes.ok) {
         const data = await membersRes.json();
         setProjectMembers(data);
-      }
-      if (emailRes && emailRes.ok) {
-        const emailData = await emailRes.json();
-        setEmailStatus(emailData);
       }
     } catch (err) {
       console.error("Failed to load project members:", err);
     } finally {
       setLoadingMembers(false);
-    }
-  };
-
-  const handleSendTestEmail = async () => {
-    if (!activeAccessProject) return;
-    setTestingEmail(true);
-    setAccessFeedback(null);
-    try {
-      const response = await fetch(`${API_BASE}/api/projects/${activeAccessProject.id}/test-alert-email`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ anomaly_type: "violence" })
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.detail || "Failed to dispatch test email.");
-      }
-      setAccessFeedback({
-        type: "success",
-        text: data.message || "Test alert email successfully dispatched to registered members!"
-      });
-    } catch (err: any) {
-      setAccessFeedback({
-        type: "error",
-        text: err.message || "Failed to dispatch test alert email."
-      });
-    } finally {
-      setTestingEmail(false);
     }
   };
 
@@ -736,7 +699,7 @@ export default function Dashboard() {
             Welcome back, {currentUser.name}
           </h1>
           <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", marginTop: "4px" }}>
-            Managing node streams for <span style={{ color: "var(--secondary)", fontWeight: 600 }}>{currentUser.org}</span>
+            Organization: <span style={{ color: "var(--secondary)", fontWeight: 600 }}>{currentUser.org ? currentUser.org.toUpperCase() : "SIT"}</span>
           </p>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
@@ -752,7 +715,7 @@ export default function Dashboard() {
             color: "var(--text-secondary)"
           }}>
             <UserCheck size={16} color="var(--success)" />
-            <span>Admin Gateway Active</span>
+            <span>Admin</span>
           </div>
           <button 
             onClick={handleLogout} 
@@ -848,7 +811,6 @@ export default function Dashboard() {
         }}>
           <div>
             <h2 style={{ fontSize: "1.4rem", fontWeight: 700 }}>Monitor Workspaces</h2>
-            <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem", marginTop: "2px" }}>Select a project workspace below to view real-time streams and operations</p>
           </div>
           {/* Top-right Create Project button: Visible at start; vanishes when bottom button scrolls into view */}
           <button 
@@ -1071,14 +1033,38 @@ export default function Dashboard() {
                   <Link 
                     to={`/project/${project.id}/view`} 
                     className="btn-primary" 
-                    style={{ flex: 1, padding: "10px", fontSize: "0.85rem", justifyContent: "center" }}
+                    style={{ flex: 1, padding: "10px", fontSize: "0.85rem", justifyContent: "center", textDecoration: "none" }}
                   >
                     Live Console
                   </Link>
                   <Link 
                     to={`/project/${project.id}/setup`} 
-                    className="btn-secondary" 
-                    style={{ padding: "10px 14px", fontSize: "0.85rem", justifyContent: "center" }}
+                    style={{ 
+                      padding: "10px 16px", 
+                      fontSize: "0.85rem", 
+                      justifyContent: "center",
+                      background: "linear-gradient(135deg, #8b5cf6, #6d28d9)",
+                      color: "#fff",
+                      border: "1px solid rgba(167, 139, 250, 0.4)",
+                      borderRadius: "var(--radius-md)",
+                      fontFamily: "var(--font-display)",
+                      fontWeight: 600,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      textDecoration: "none",
+                      boxShadow: "0 4px 14px rgba(139, 92, 246, 0.35)",
+                      transition: "var(--transition)"
+                    }}
+                    onMouseEnter={(e) => {
+                      e.currentTarget.style.transform = "translateY(-2px)";
+                      e.currentTarget.style.boxShadow = "0 6px 20px rgba(139, 92, 246, 0.55)";
+                      e.currentTarget.style.opacity = "0.95";
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.style.transform = "translateY(0)";
+                      e.currentTarget.style.boxShadow = "0 4px 14px rgba(139, 92, 246, 0.35)";
+                      e.currentTarget.style.opacity = "1";
+                    }}
                   >
                     Setup
                   </Link>
@@ -1175,8 +1161,8 @@ export default function Dashboard() {
               borderBottom: "1px solid var(--border-glass)"
             }}>
               <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                <ShieldAlert size={20} color="var(--danger)" />
-                <span style={{ fontWeight: 700, fontSize: "1.1rem" }}>Project Threat Logs</span>
+                <Bell size={20} color="var(--danger)" />
+                <span style={{ fontWeight: 700, fontSize: "1.1rem" }}>Notification Dashboard</span>
               </div>
               <div style={{ display: "flex", alignItems: "center" }}>
                 <button 
@@ -2495,54 +2481,6 @@ export default function Dashboard() {
                   <span>{accessFeedback.text}</span>
                 </div>
               )}
-
-              {/* Automated Anomaly Email Alerts Info Banner */}
-              <div style={{
-                background: "rgba(99, 102, 241, 0.08)",
-                border: "1px solid rgba(99, 102, 241, 0.25)",
-                borderRadius: "var(--radius-sm)",
-                padding: "12px 14px",
-                marginBottom: "20px",
-                display: "flex",
-                flexDirection: "column",
-                gap: "8px"
-              }}>
-                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                  <Mail size={16} color="var(--primary)" />
-                  <span style={{ fontSize: "0.82rem", fontWeight: 700, color: "#fff" }}>
-                    Automated S3 Cloud Anomaly Email Alerts
-                  </span>
-                </div>
-                <p style={{ margin: 0, fontSize: "0.75rem", color: "var(--text-secondary)", lineHeight: 1.45 }}>
-                  Whenever unusual activity is verified by AI and saved to cloud storage, instant email alerts with camera location, zone tag, and cloud S3 snapshot links are automatically dispatched to the email holders below.
-                </p>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "4px", paddingTop: "8px", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
-                  <span style={{ fontSize: "0.72rem", color: emailStatus?.smtp?.configured ? "var(--success)" : "#f59e0b" }}>
-                    {emailStatus?.smtp?.configured ? "● Live SMTP Delivery Ready" : "● Email Service Active (Simulated / Configurable in .env)"}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={handleSendTestEmail}
-                    disabled={testingEmail || projectMembers.length === 0}
-                    style={{
-                      background: "rgba(99, 102, 241, 0.2)",
-                      border: "1px solid rgba(99, 102, 241, 0.4)",
-                      borderRadius: "4px",
-                      color: "#fff",
-                      padding: "4px 10px",
-                      fontSize: "0.72rem",
-                      fontWeight: 600,
-                      cursor: testingEmail ? "wait" : "pointer",
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "5px"
-                    }}
-                  >
-                    <Send size={12} />
-                    {testingEmail ? "Sending Alert..." : "Send Test Alert Email"}
-                  </button>
-                </div>
-              </div>
 
               {/* Current Active Members */}
               <div>

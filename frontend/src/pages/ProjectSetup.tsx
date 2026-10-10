@@ -166,19 +166,6 @@ export default function ProjectSetup() {
     );
   };
 
-  const handlePresetSelection = (preset: "all" | "responders" | "viewers" | "none") => {
-    const nonAdminMembers = members.filter(m => m.role?.toLowerCase() !== "admin");
-    if (preset === "all") {
-      setSelectedMemberEmailsForAccess(nonAdminMembers.map(m => m.email));
-    } else if (preset === "responders") {
-      setSelectedMemberEmailsForAccess(nonAdminMembers.filter(m => m.role?.toLowerCase() === "responder").map(m => m.email));
-    } else if (preset === "viewers") {
-      setSelectedMemberEmailsForAccess(nonAdminMembers.filter(m => m.role?.toLowerCase() === "viewer").map(m => m.email));
-    } else if (preset === "none") {
-      setSelectedMemberEmailsForAccess([]);
-    }
-  };
-
   const handleCloseCameraAccessModal = () => {
     setShowCameraAccessModal(false);
     setCameraAccessFeedback(null);
@@ -564,15 +551,43 @@ export default function ProjectSetup() {
       {/* Top Navbar */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "40px" }}>
         <div style={{ display: "flex", gap: "12px" }}>
-          <button onClick={() => navigate("/dashboard")} className="btn-secondary" style={{ padding: "8px 16px" }}>
+          <button 
+            onClick={() => navigate("/dashboard")} 
+            style={{ 
+              padding: "8px 18px",
+              fontSize: "0.85rem",
+              background: "linear-gradient(135deg, #8b5cf6, #6d28d9)",
+              color: "#fff",
+              border: "1px solid rgba(167, 139, 250, 0.4)",
+              borderRadius: "var(--radius-md)",
+              fontFamily: "var(--font-display)",
+              fontWeight: 600,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "8px",
+              cursor: "pointer",
+              boxShadow: "0 4px 14px rgba(139, 92, 246, 0.35)",
+              transition: "var(--transition)"
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.transform = "translateY(-2px)";
+              e.currentTarget.style.boxShadow = "0 6px 20px rgba(139, 92, 246, 0.55)";
+              e.currentTarget.style.opacity = "0.95";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.transform = "translateY(0)";
+              e.currentTarget.style.boxShadow = "0 4px 14px rgba(139, 92, 246, 0.35)";
+              e.currentTarget.style.opacity = "1";
+            }}
+          >
             <ArrowLeft size={16} />
-            Hub
+            Back
           </button>
         </div>
         <div>
           <h1 style={{ fontSize: "1.4rem", fontWeight: 700 }}>{project.name}</h1>
           <p style={{ color: "var(--text-secondary)", fontSize: "0.8rem", textAlign: "right" }}>
-            Ingestion Hub / {project.project_type.toUpperCase()}
+            Category: <span style={{ color: "var(--secondary)", fontWeight: 600 }}>{project.project_type.toUpperCase()}</span>
           </p>
         </div>
       </div>
@@ -751,7 +766,7 @@ export default function ProjectSetup() {
                   type="button"
                   onClick={handleTestNVR}
                   disabled={actionLoading !== null}
-                  className="btn-secondary"
+                  className="btn-primary"
                   style={{ display: "flex", alignItems: "center", gap: "8px" }}
                 >
                   {actionLoading === "test_nvr" ? <Loader2 className="pulse-live-icon" style={{ background: "none", boxShadow: "none" }} size={16} /> : <Settings size={16} />}
@@ -872,7 +887,7 @@ export default function ProjectSetup() {
                   type="button"
                   onClick={handleTestStandalone}
                   disabled={actionLoading !== null}
-                  className="btn-secondary"
+                  className="btn-primary"
                   style={{ display: "flex", alignItems: "center", gap: "8px" }}
                 >
                   {actionLoading === "test_cam" ? <Loader2 className="pulse-live-icon" style={{ background: "none", boxShadow: "none" }} size={16} /> : <Play size={16} />}
@@ -931,10 +946,6 @@ export default function ProjectSetup() {
               </span>
             </div>
           </div>
-          
-          <p style={{ color: "var(--text-secondary)", fontSize: "0.8rem", margin: 0 }}>
-            Live surveillance feeds currently active and monitored by Edge YOLOv8 analytics.
-          </p>
 
           <button 
             onClick={() => navigate(`/project/${id}/view`)} 
@@ -1027,7 +1038,7 @@ export default function ProjectSetup() {
                     style={{ padding: "6px 12px", fontSize: "0.75rem", gap: "6px" }}
                   >
                     <Users size={13} />
-                    Assign Viewer / Responder Access
+                    Assign Access
                   </button>
                 </div>
               </div>
@@ -1141,16 +1152,6 @@ export default function ProjectSetup() {
                                   📍 {cam.zone_tag}
                                 </span>
                               )}
-                              <span style={{
-                                fontSize: "0.68rem",
-                                background: cam.ai_active ? "rgba(16, 185, 129, 0.12)" : "rgba(255,255,255,0.04)",
-                                color: cam.ai_active ? "var(--success)" : "var(--text-muted)",
-                                border: `1px solid ${cam.ai_active ? "rgba(16, 185, 129, 0.25)" : "var(--border-glass)"}`,
-                                padding: "1px 6px",
-                                borderRadius: "4px"
-                              }}>
-                                {cam.ai_active ? "⚡ YOLOv8 AI Active" : "AI Inactive"}
-                              </span>
 
                               {/* Camera Visibility Badge */}
                               <span style={{
@@ -1463,27 +1464,6 @@ export default function ProjectSetup() {
               </h2>
             </div>
 
-            <p style={{ color: "var(--text-secondary)", fontSize: "0.82rem", marginBottom: "14px", lineHeight: 1.5 }}>
-              Configure which <strong>Responders</strong> and <strong>Viewers</strong> are permitted to watch this live stream and receive automated threat alerts.
-            </p>
-
-            {/* Permanent Admin Access Info Banner */}
-            <div style={{
-              background: "rgba(6, 182, 212, 0.08)",
-              border: "1px solid rgba(6, 182, 212, 0.25)",
-              borderRadius: "8px",
-              padding: "10px 14px",
-              marginBottom: "16px",
-              display: "flex",
-              alignItems: "center",
-              gap: "10px"
-            }}>
-              <span style={{ fontSize: "1.15rem" }}>🛡️</span>
-              <div style={{ fontSize: "0.76rem", color: "#e2e8f0", lineHeight: 1.45 }}>
-                <strong style={{ color: "var(--secondary)" }}>Facility Admins have permanent full access:</strong> Admins automatically view all camera feeds and receive all threat alerts. The toggles below are exclusively for <strong>Responders</strong> and <strong>Viewers</strong>.
-              </div>
-            </div>
-
             {/* Target Cameras Pills */}
             <div style={{
               background: "rgba(255, 255, 255, 0.03)",
@@ -1509,87 +1489,6 @@ export default function ProjectSetup() {
                     📹 {c.name}
                   </span>
                 ))}
-              </div>
-            </div>
-
-            {/* Quick Presets */}
-            <div style={{ marginBottom: "16px" }}>
-              <span style={{ fontSize: "0.72rem", color: "var(--text-muted)", textTransform: "uppercase", fontWeight: 700, display: "block", marginBottom: "8px" }}>
-                Quick Permissions Presets:
-              </span>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
-                <button
-                  type="button"
-                  onClick={() => handlePresetSelection("all")}
-                  style={{
-                    background: "rgba(255,255,255,0.04)",
-                    border: "1px solid var(--border-glass)",
-                    borderRadius: "4px",
-                    color: "#e2e8f0",
-                    fontSize: "0.74rem",
-                    padding: "5px 9px",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "5px"
-                  }}
-                >
-                  🌐 All Responders & Viewers
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handlePresetSelection("responders")}
-                  style={{
-                    background: "rgba(245, 158, 11, 0.1)",
-                    border: "1px solid rgba(245, 158, 11, 0.3)",
-                    borderRadius: "4px",
-                    color: "var(--warning)",
-                    fontSize: "0.74rem",
-                    padding: "5px 9px",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "5px"
-                  }}
-                >
-                  🚨 Responders Only
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handlePresetSelection("viewers")}
-                  style={{
-                    background: "rgba(168, 85, 247, 0.1)",
-                    border: "1px solid rgba(168, 85, 247, 0.3)",
-                    borderRadius: "4px",
-                    color: "#c084fc",
-                    fontSize: "0.74rem",
-                    padding: "5px 9px",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "5px"
-                  }}
-                >
-                  👁️ Viewers Only
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handlePresetSelection("none")}
-                  style={{
-                    background: "rgba(239, 68, 68, 0.1)",
-                    border: "1px solid rgba(239, 68, 68, 0.3)",
-                    borderRadius: "4px",
-                    color: "var(--danger)",
-                    fontSize: "0.74rem",
-                    padding: "5px 9px",
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "5px"
-                  }}
-                >
-                  🔒 Admins Only (Restricted)
-                </button>
               </div>
             </div>
 

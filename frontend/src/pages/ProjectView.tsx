@@ -134,7 +134,6 @@ export default function ProjectView() {
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [activeAlerts, setActiveAlerts] = useState<Record<string, any>>({});
   const [offlineCameras, setOfflineCameras] = useState<Record<string, boolean>>({});
-  const [showTelemetry, setShowTelemetry] = useState(false);
   
   // Highlighting specific camera
   const [highlightedCamId, setHighlightedCamId] = useState<string | null>(null);
@@ -146,6 +145,74 @@ export default function ProjectView() {
   const [violenceFilter, setViolenceFilter] = useState<ViolenceFilterType>("all");
   const [activePopupAlert, setActivePopupAlert] = useState<any | null>(null);
   const [selectedEvidenceAlert, setSelectedEvidenceAlert] = useState<any | null>(null);
+  const [evidenceZoomScale, setEvidenceZoomScale] = useState(1);
+  const [evidencePanOffset, setEvidencePanOffset] = useState({ x: 0, y: 0 });
+  const [isEvidenceDragging, setIsEvidenceDragging] = useState(false);
+  const [evidenceDragStart, setEvidenceDragStart] = useState({ x: 0, y: 0 });
+
+  useEffect(() => {
+    setEvidenceZoomScale(1);
+    setEvidencePanOffset({ x: 0, y: 0 });
+    setIsEvidenceDragging(false);
+  }, [selectedEvidenceAlert]);
+
+  const handleEvidenceZoomIn = (e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    setEvidenceZoomScale(prev => Math.min(prev + 0.25, 4));
+  };
+
+  const handleEvidenceZoomOut = (e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    setEvidenceZoomScale(prev => {
+      const next = Math.max(prev - 0.25, 1);
+      if (next === 1) {
+        setEvidencePanOffset({ x: 0, y: 0 });
+      }
+      return next;
+    });
+  };
+
+  const handleEvidenceZoomReset = (e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    setEvidenceZoomScale(1);
+    setEvidencePanOffset({ x: 0, y: 0 });
+  };
+
+  const handleEvidenceMouseDown = (e: React.MouseEvent) => {
+    if (evidenceZoomScale <= 1) return;
+    e.preventDefault();
+    setIsEvidenceDragging(true);
+    setEvidenceDragStart({ x: e.clientX - evidencePanOffset.x, y: e.clientY - evidencePanOffset.y });
+  };
+
+  const handleEvidenceMouseMove = (e: React.MouseEvent) => {
+    if (!isEvidenceDragging) return;
+    e.preventDefault();
+    setEvidencePanOffset({
+      x: e.clientX - evidenceDragStart.x,
+      y: e.clientY - evidenceDragStart.y
+    });
+  };
+
+  const handleEvidenceMouseUpOrLeave = () => {
+    setIsEvidenceDragging(false);
+  };
+
+  const handleEvidenceWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    const zoomFactor = 0.15;
+    if (e.deltaY < 0) {
+      setEvidenceZoomScale(prev => Math.min(prev + zoomFactor, 4));
+    } else {
+      setEvidenceZoomScale(prev => {
+        const next = Math.max(prev - zoomFactor, 1);
+        if (next === 1) {
+          setEvidencePanOffset({ x: 0, y: 0 });
+        }
+        return next;
+      });
+    }
+  };
   const [newMemberEmail, setNewMemberEmail] = useState("");
   const [newMemberRole, setNewMemberRole] = useState("responder");
 
@@ -153,17 +220,6 @@ export default function ProjectView() {
   const [editingCamera, setEditingCamera] = useState<CameraItem | null>(null);
   const [editForm, setEditForm] = useState({ name: "", rtspUrl: "", zoneTag: "" });
   const [isSavingCamera, setIsSavingCamera] = useState(false);
-
-  // Inference Injector controls
-  const [showSimPanel, setShowSimPanel] = useState(false);
-  const [simCameraId, setSimCameraId] = useState("");
-  const [simConfidence, setSimConfidence] = useState(() => {
-    const saved = localStorage.getItem("simConfidence");
-    return saved ? Number(saved) : 0.85;
-  });
-  const [isAutoDetecting, setIsAutoDetecting] = useState(false);
-  const [lastDetectionTime, setLastDetectionTime] = useState<string | null>(null);
-  const [isSimulating, setIsSimulating] = useState(false);
 
   // Sound settings
   const soundEnabled = true;
@@ -344,10 +400,6 @@ export default function ProjectView() {
         
         // Active alerts are only populated via real-time WebSocket events to avoid historical overlays on startup
         setActiveAlerts({});
-        
-        if (data.cameras.length > 0) {
-          setSimCameraId(data.cameras[0].id);
-        }
       } catch (err) {
         console.error("Failed to load live matrix data", err);
       }
@@ -1119,61 +1171,6 @@ export default function ProjectView() {
     }
   };
 
-  // ─── Auto YOLO detection loop ───────────────────────────────────────────────
-  // Runs every 12 seconds when isAutoDetecting is true.
-  // Probability of firing a detection event is proportional to simConfidence.
-  // Captures the current canvas frame of a randomly chosen active camera
-  // and POSTs it to the backend detect endpoint for Gemini verification.
-  useEffect(() => {
-    if (!isAutoDetecting || cameras.length === 0) return;
-
-    const runDetection = async () => {
-      // Detection probability based on sensitivity level
-      const prob = simConfidence >= 0.90 ? 0.75 :
-                   simConfidence >= 0.80 ? 0.60 :
-                   simConfidence >= 0.55 ? 0.40 :
-                   simConfidence >= 0.30 ? 0.20 : 0.0;
-
-      if (Math.random() > prob) return; // YOLO found nothing this cycle
-
-      // Pick camera: prefer selected camera, else random (excluding manually disconnected or offline cameras)
-      const candidateCameras = cameras.filter(c => c.ai_active && !offlineCameras[c.id]);
-      if (candidateCameras.length === 0) return;
-      
-      const targetCam = cameras.find(c => c.id === simCameraId);
-      const targetId = simCameraId && targetCam && targetCam.ai_active && !offlineCameras[simCameraId]
-        ? simCameraId
-        : candidateCameras[Math.floor(Math.random() * candidateCameras.length)].id;
-
-      // Capture canvas frame at this exact moment
-      let base64Image = "";
-      const canvasEl = canvasRefs.current[targetId];
-      if (canvasEl) {
-        try { base64Image = canvasEl.toDataURL("image/jpeg", 0.85); }
-        catch { /* cross-origin, backend will fetch directly */ }
-      }
-
-      setIsSimulating(true);
-      try {
-        await fetch(`${API_BASE}/api/cameras/${targetId}/detect`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ camera_id: targetId, confidence: simConfidence, image_base64: base64Image })
-        });
-        setLastDetectionTime(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
-      } catch (err) {
-        console.error("Auto-detection cycle failed:", err);
-      } finally {
-        setIsSimulating(false);
-      }
-    };
-
-    const interval = setInterval(runDetection, 12000);
-    runDetection(); // Run immediately on start
-    return () => clearInterval(interval);
-  }, [isAutoDetecting, cameras, simConfidence, simCameraId, offlineCameras]);
-
-
   if (!project) return null;
 
   // Grid layout helper depending on camera counts
@@ -1199,17 +1196,35 @@ export default function ProjectView() {
       }}>
         <button 
           onClick={() => navigate("/dashboard")} 
-          className="btn-secondary" 
           style={{
-            background: "rgba(10,5,27,0.75)",
-            border: "1px solid var(--border-glass)",
+            background: "linear-gradient(135deg, #8b5cf6, #6d28d9)",
+            color: "#fff",
+            border: "1px solid rgba(167, 139, 250, 0.4)",
+            borderRadius: "var(--radius-md)",
+            fontFamily: "var(--font-display)",
+            fontWeight: 600,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "6px",
+            cursor: "pointer",
+            boxShadow: "0 4px 14px rgba(139, 92, 246, 0.35)",
             padding: "8px 16px",
             fontSize: "0.8rem",
-            backdropFilter: "blur(10px)"
+            transition: "var(--transition)"
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.transform = "translateY(-2px)";
+            e.currentTarget.style.boxShadow = "0 6px 20px rgba(139, 92, 246, 0.55)";
+            e.currentTarget.style.opacity = "0.95";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.transform = "translateY(0)";
+            e.currentTarget.style.boxShadow = "0 4px 14px rgba(139, 92, 246, 0.35)";
+            e.currentTarget.style.opacity = "1";
           }}
         >
           <ArrowLeft size={14} />
-          Hub
+          Back
         </button>
         <div style={{
           background: "rgba(10,5,27,0.75)",
@@ -1225,75 +1240,8 @@ export default function ProjectView() {
           <span style={{ height: "12px", width: "1px", background: "var(--border-glass)" }}></span>
           <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "0.75rem", color: "var(--text-secondary)" }}>
             <Radio size={14} color="var(--success)" className="pulse-live-icon" style={{ padding: 0, borderRadius: "50%", background: "none", boxShadow: "none" }} />
-            <span>Inference Matrix Streaming</span>
+            <span>Streaming</span>
           </div>
-        </div>
-        <div style={{
-          background: "rgba(10,5,27,0.75)",
-          border: "1px solid var(--border-glass)",
-          padding: "8px 16px",
-          borderRadius: "var(--radius-md)",
-          backdropFilter: "blur(10px)",
-          display: "flex",
-          alignItems: "center",
-          gap: "8px",
-          fontSize: "0.8rem",
-          color: "var(--text-secondary)",
-          position: "relative",
-          cursor: "pointer",
-          userSelect: "none"
-        }}
-        title="Stream Telemetry Details"
-        onMouseEnter={() => setShowTelemetry(true)}
-        onMouseLeave={() => setShowTelemetry(false)}
-        >
-          <Activity size={14} color="var(--primary)" />
-          <span>Stream Info & Speeds</span>
-          {showTelemetry && (
-            <div style={{
-              position: "absolute",
-              top: "36px",
-              left: "0",
-              width: "280px",
-              background: "rgba(12, 7, 33, 0.95)",
-              border: "1px solid var(--border-glass)",
-              borderRadius: "var(--radius-md)",
-              padding: "16px",
-              boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
-              zIndex: 100,
-              display: "flex",
-              flexDirection: "column",
-              gap: "8px",
-              color: "#fff",
-              textAlign: "left"
-            }}>
-              <h4 style={{ margin: "0 0 4px 0", fontSize: "0.8rem", fontWeight: 700, color: "var(--primary)", borderBottom: "1px solid var(--border-glass)", paddingBottom: "4px" }}>Stream Telemetry Specifications</h4>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--text-muted)" }}>Video Quality:</span>
-                <span>JPEG 90% Quality</span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--text-muted)" }}>Display Rate:</span>
-                <span>30 FPS</span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--text-muted)" }}>AI Inferences:</span>
-                <span>2.5 Hz (every 0.4s)</span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--text-muted)" }}>UI Alert Sync:</span>
-                <span>Every 2s</span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--text-muted)" }}>UI Config Sync:</span>
-                <span>Every 5s</span>
-              </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: "2px", borderTop: "1px solid var(--border-glass)", paddingTop: "4px", fontSize: "0.68rem" }}>
-                <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Low Latency Profile:</span>
-                <span style={{ fontFamily: "monospace", color: "var(--success)" }}>probesize=1024, analyzeduration=0, fflags=nobuffer</span>
-              </div>
-            </div>
-          )}
         </div>
         <button 
           onClick={() => setShowLogsDrawer(true)}
@@ -1601,7 +1549,7 @@ export default function ProjectView() {
                         setEditForm({
                           name: cam.name,
                           rtspUrl: cam.rtsp_url,
-                          zoneTag: cam.zone_tag || ""
+                          zoneTag: cam.name
                         });
                       }}
                       className="btn-secondary"
@@ -1681,173 +1629,6 @@ export default function ProjectView() {
           </div>
         )}
       </div>
-
-      {/* Floating Inference Injector on the Bottom Left */}
-      <div style={{
-        position: "fixed",
-        bottom: "24px",
-        left: "24px",
-        zIndex: 50
-      }}>
-        <button
-          onClick={() => setShowSimPanel(!showSimPanel)}
-          className="btn-secondary"
-          style={{
-            background: "rgba(10,5,27,0.85)",
-            border: "1px solid var(--border-glass)",
-            borderRadius: "var(--radius-lg)",
-            padding: "0 18px",
-            height: "48px",
-            display: "flex",
-            alignItems: "center",
-            gap: "8px",
-            backdropFilter: "blur(10px)",
-            boxShadow: "0 4px 20px rgba(0,0,0,0.4)",
-            fontWeight: 600,
-            fontSize: "0.85rem",
-            color: "var(--warning)"
-          }}
-        >
-          <Activity size={16} />
-          Inference Injector
-        </button>
-      </div>
-
-
-      {/* Inference Injector Panel */}
-      {showSimPanel && (
-        <div style={{
-          position: "fixed",
-          bottom: "84px",
-          left: "24px",
-          width: "360px",
-          zIndex: 60,
-          padding: "24px"
-        }} className="glass-panel glow-active">
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "16px" }}>
-            <h3 style={{ fontSize: "1rem", fontWeight: 700, display: "flex", alignItems: "center", gap: "6px", color: "var(--warning)" }}>
-              <ShieldAlert size={18} />
-              YOLOv8 Inference Control
-            </h3>
-            <button onClick={() => setShowSimPanel(false)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)" }}>
-              <X size={16} />
-            </button>
-          </div>
-
-          {/* Camera selector */}
-          <div className="form-group">
-            <label className="form-label" style={{ fontSize: "0.75rem" }}>Monitor Camera Feed</label>
-            <select
-              value={simCameraId}
-              onChange={(e) => setSimCameraId(e.target.value)}
-              className="form-input"
-              style={{ background: "#0a051b", fontSize: "0.85rem", padding: "8px 12px" }}
-            >
-              <option value="">All Cameras (auto-select)</option>
-              {cameras.map(c => (
-                <option key={c.id} value={c.id}>{c.name}</option>
-              ))}
-            </select>
-          </div>
-
-          {/* Auto YOLO Scan Simulation Toggle */}
-          <div className="form-group" style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "16px" }}>
-            <input
-              type="checkbox"
-              id="isAutoDetectingCheckbox"
-              checked={isAutoDetecting}
-              onChange={(e) => setIsAutoDetecting(e.target.checked)}
-              style={{ cursor: "pointer", width: "16px", height: "16px" }}
-            />
-            <label htmlFor="isAutoDetectingCheckbox" style={{ fontSize: "0.8rem", fontWeight: 600, cursor: "pointer", userSelect: "none", color: "var(--text-secondary)" }}>
-              Enable Simulated Threat Auto-Injection
-            </label>
-          </div>
-
-          {/* Sensitivity slider */}
-          <div className="form-group">
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: "0.75rem", color: "var(--text-secondary)", marginBottom: "6px" }}>
-              <span>Detection Sensitivity</span>
-              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                <span style={{
-                  fontWeight: 700, fontSize: "0.7rem", padding: "2px 8px", borderRadius: "4px",
-                  background: simConfidence >= 0.90 ? "rgba(239,68,68,0.2)" :
-                              simConfidence >= 0.80 ? "rgba(249,115,22,0.2)" :
-                              simConfidence >= 0.55 ? "rgba(234,179,8,0.2)" :
-                              simConfidence >= 0.30 ? "rgba(59,130,246,0.2)" : "rgba(100,116,139,0.2)",
-                  color: simConfidence >= 0.90 ? "var(--danger)" :
-                         simConfidence >= 0.80 ? "#f97316" :
-                         simConfidence >= 0.55 ? "#eab308" :
-                         simConfidence >= 0.30 ? "#3b82f6" : "var(--text-muted)",
-                  border: `1px solid ${
-                    simConfidence >= 0.90 ? "rgba(239,68,68,0.4)" :
-                    simConfidence >= 0.80 ? "rgba(249,115,22,0.4)" :
-                    simConfidence >= 0.55 ? "rgba(234,179,8,0.4)" :
-                    simConfidence >= 0.30 ? "rgba(59,130,246,0.4)" : "rgba(100,116,139,0.3)"
-                  }`
-                }}>
-                  {simConfidence >= 0.90 ? "⚡ VIOLENCE" :
-                   simConfidence >= 0.80 ? "🔥 FIRE" :
-                   simConfidence >= 0.55 ? "🚨 TRESPASSING" :
-                   simConfidence >= 0.30 ? "👁 LOITERING" : "✅ NORMAL"}
-                </span>
-                <span style={{ fontWeight: 600 }}>{(simConfidence * 100).toFixed(0)}%</span>
-              </div>
-            </div>
-            <input
-              type="range" min="0.10" max="1.00" step="0.05"
-              value={simConfidence}
-              onChange={(e) => {
-                const val = Number(e.target.value);
-                setSimConfidence(val);
-                localStorage.setItem("simConfidence", String(val));
-              }}
-              style={{ width: "100%", accentColor: "var(--warning)" }}
-            />
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.6rem", color: "var(--text-muted)", marginTop: "4px" }}>
-              <span style={{ color: "#3b82f6" }}>30% Loitering</span>
-              <span style={{ color: "#eab308" }}>55% Trespassing</span>
-              <span style={{ color: "#f97316" }}>80% Fire</span>
-              <span style={{ color: "var(--danger)" }}>90% Violence</span>
-            </div>
-          </div>
-
-          {/* Status row */}
-          {isAutoDetecting && (
-            <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "12px", fontSize: "0.72rem", color: "var(--text-secondary)" }}>
-              <span style={{
-                width: "8px", height: "8px", borderRadius: "50%",
-                background: isSimulating ? "var(--warning)" : "var(--success)",
-                boxShadow: isSimulating ? "0 0 6px var(--warning)" : "0 0 6px var(--success)",
-                animation: "pulse 1.5s ease-in-out infinite"
-              }} />
-              {isSimulating ? "Verifying with Gemini..." : `Scanning every 12s${lastDetectionTime ? " · Last: " + lastDetectionTime : ""}`}
-            </div>
-          )}
-
-          {/* OK Button */}
-          <button
-            onClick={() => {
-              setShowSimPanel(false);
-            }}
-            className="btn-primary"
-            style={{
-              width: "100%",
-              justifyContent: "center",
-              padding: "10px",
-              background: "linear-gradient(135deg, var(--warning), var(--accent))",
-              boxShadow: "none"
-            }}
-          >
-            OK
-          </button>
-
-          <p style={{ fontSize: "0.62rem", color: "var(--text-muted)", marginTop: "10px", textAlign: "center" }}>
-            YOLO scans the live feed every 12s. Detections are sent to Gemini for verification.
-            Only verified threats appear in notifications.
-          </p>
-        </div>
-      )}
 
       {/* Add Member Slider Overlay */}
       {showMemberModal && (
@@ -1968,24 +1749,7 @@ export default function ProjectView() {
               </div>
 
               <div className="form-group">
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "4px" }}>
-                  <label className="form-label" style={{ margin: 0 }}>Zone Tag</label>
-                  <button
-                    type="button"
-                    onClick={() => setEditForm(prev => ({ ...prev, zoneTag: prev.name }))}
-                    style={{
-                      background: "none",
-                      border: "none",
-                      color: "#818cf8",
-                      fontSize: "0.72rem",
-                      cursor: "pointer",
-                      textDecoration: "underline",
-                      padding: 0
-                    }}
-                  >
-                    Sync with Camera Name
-                  </button>
-                </div>
+                <label className="form-label">Zone Tag</label>
                 <input
                   type="text"
                   value={editForm.zoneTag}
@@ -2054,7 +1818,7 @@ export default function ProjectView() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "24px" }}>
               <h2 style={{ fontSize: "1.2rem", fontWeight: 700, display: "flex", alignItems: "center", gap: "8px" }}>
                 <Bell size={20} color="var(--danger)" />
-                Incident Log Drawer
+                Notification Dashboard
               </h2>
               <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
                 <button onClick={() => setShowLogsDrawer(false)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", display: "flex", alignItems: "center" }}>
@@ -2423,7 +2187,7 @@ export default function ProjectView() {
 
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "12px" }}>
                         <span style={{ fontSize: "0.7rem", color: "var(--text-muted)" }}>
-                          {alert.threat_description.includes("[Not Gemini Verified]") ? "Model Conf:" : "Gemini Conf:"} <strong style={{ color: "var(--primary)" }}>{(alert.confidence_score * 100).toFixed(0)}%</strong>
+                          {alert.threat_description.includes("[Not Gemini Verified]") || alert.threat_description.includes("[Offline Analysis]") ? "Model Score:" : "Gemini Conf:"} <strong style={{ color: "var(--primary)" }}>{(alert.confidence_score * 100).toFixed(0)}%</strong>
                         </span>
                         <div style={{ display: "flex", gap: "8px" }}>
                           {(() => {
@@ -2923,16 +2687,25 @@ export default function ProjectView() {
 
             {/* Split layout: Snapshot & Metadata details */}
             <div style={{ display: "flex", flex: 1, minHeight: "450px" }}>
-              {/* Left Column: Native resolution snapshot frame */}
-              <div style={{
-                flex: 1.5,
-                background: "#000",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                borderRight: "1px solid var(--border-glass)",
-                position: "relative"
-              }}>
+              {/* Left Column: Interactive Zoomable snapshot frame */}
+              <div 
+                style={{
+                  flex: 1.5,
+                  background: "#000",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  borderRight: "1px solid var(--border-glass)",
+                  position: "relative",
+                  overflow: "hidden",
+                  userSelect: "none"
+                }}
+                onMouseDown={handleEvidenceMouseDown}
+                onMouseMove={handleEvidenceMouseMove}
+                onMouseUp={handleEvidenceMouseUpOrLeave}
+                onMouseLeave={handleEvidenceMouseUpOrLeave}
+                onWheel={handleEvidenceWheel}
+              >
                 <img 
                   src={getSnapshotUrl(selectedEvidenceAlert.snapshot_url)} 
                   alt="Incident Evidence Raw Snapshot" 
@@ -2940,7 +2713,11 @@ export default function ProjectView() {
                     maxWidth: "100%",
                     maxHeight: "480px",
                     objectFit: "contain",
-                    display: "block"
+                    display: "block",
+                    transform: `scale(${evidenceZoomScale}) translate(${evidencePanOffset.x}px, ${evidencePanOffset.y}px)`,
+                    transformOrigin: "center",
+                    cursor: evidenceZoomScale > 1 ? (isEvidenceDragging ? "grabbing" : "grab") : "default",
+                    transition: isEvidenceDragging ? "none" : "transform 0.2s ease-out"
                   }}
                   onError={(e) => {
                     const fallback = getSnapshotFallbackUrl(selectedEvidenceAlert);
@@ -2949,17 +2726,47 @@ export default function ProjectView() {
                     }
                   }}
                 />
+
+                {/* Floating Zoom Controls over Image */}
                 <div style={{
                   position: "absolute",
-                  bottom: "12px",
-                  left: "12px",
-                  background: "rgba(0,0,0,0.75)",
-                  padding: "4px 8px",
-                  borderRadius: "4px",
-                  fontSize: "0.65rem",
-                  color: "var(--text-muted)"
+                  bottom: "16px",
+                  left: "50%",
+                  transform: "translateX(-50%)",
+                  background: "rgba(10, 5, 27, 0.85)",
+                  border: "1px solid var(--border-glass)",
+                  borderRadius: "var(--radius-md)",
+                  padding: "6px 12px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  backdropFilter: "blur(6px)",
+                  zIndex: 10
                 }}>
-                  NATIVE CAPTURE RESOLUTION (JPEG 90% QUALITY)
+                  <button 
+                    onClick={handleEvidenceZoomOut} 
+                    style={{ background: "transparent", border: "none", cursor: "pointer", display: "flex", padding: "4px" }}
+                    title="Zoom Out"
+                  >
+                    <ZoomOut size={16} color="#fff" />
+                  </button>
+                  <span style={{ fontSize: "0.75rem", fontWeight: 700, color: "#fff", minWidth: "40px", textAlign: "center" }}>
+                    {Math.round(evidenceZoomScale * 100)}%
+                  </span>
+                  <button 
+                    onClick={handleEvidenceZoomIn} 
+                    style={{ background: "transparent", border: "none", cursor: "pointer", display: "flex", padding: "4px" }}
+                    title="Zoom In"
+                  >
+                    <ZoomIn size={16} color="#fff" />
+                  </button>
+                  <button 
+                    onClick={handleEvidenceZoomReset} 
+                    style={{ background: "transparent", border: "none", cursor: "pointer", display: "flex", padding: "4px" }}
+                    title="Reset Zoom"
+                  >
+                    <RefreshCw size={14} color="#fff" />
+                  </button>
                 </div>
               </div>
 
@@ -3000,30 +2807,45 @@ export default function ProjectView() {
                   </p>
                 </div>
 
-                <div>
-                  <h3 style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase" }}>Gemini Verification details</h3>
-                  <p style={{ fontSize: "0.82rem", color: "#fff", marginTop: "6px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-glass)", padding: "10px 12px", borderRadius: "6px", lineHeight: "1.4" }}>
-                    {selectedEvidenceAlert.threat_description}
-                  </p>
-                </div>
+                {(() => {
+                  const isLimitExhausted = Boolean(
+                    selectedEvidenceAlert.threat_description?.includes("[Offline Analysis]") ||
+                    selectedEvidenceAlert.threat_description?.includes("[Not Gemini Verified]")
+                  );
+                  return (
+                    <>
+                      <div>
+                        <h3 style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase" }}>
+                          {isLimitExhausted ? "Verification Details" : "Gemini Verification Details"}
+                        </h3>
+                        <p style={{ fontSize: "0.82rem", color: "#fff", marginTop: "6px", background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-glass)", padding: "10px 12px", borderRadius: "6px", lineHeight: "1.4" }}>
+                          {selectedEvidenceAlert.threat_description}
+                        </p>
+                      </div>
 
-                <div>
-                  <h3 style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase" }}>Confidence Scores</h3>
-                  <div style={{ display: "flex", gap: "16px", marginTop: "8px" }}>
-                    <div style={{ flex: 1, background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-glass)", padding: "8px 12px", borderRadius: "6px", textAlign: "center" }}>
-                      <div style={{ fontSize: "0.62rem", color: "var(--text-muted)" }}>YOLOv8 Edge</div>
-                      <div style={{ fontSize: "1.1rem", fontWeight: 800, color: "var(--warning)", marginTop: "2px" }}>
-                        {selectedEvidenceAlert.confidence_score ? `${(selectedEvidenceAlert.confidence_score * 100).toFixed(0)}%` : "N/A"}
+                      <div>
+                        <h3 style={{ fontSize: "0.72rem", color: "var(--text-muted)", fontWeight: 700, letterSpacing: "1px", textTransform: "uppercase" }}>Confidence Score</h3>
+                        <div style={{ marginTop: "8px" }}>
+                          {isLimitExhausted ? (
+                            <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-glass)", padding: "10px 14px", borderRadius: "6px", textAlign: "center" }}>
+                              <div style={{ fontSize: "0.65rem", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Model Score</div>
+                              <div style={{ fontSize: "1.2rem", fontWeight: 800, color: "var(--warning)", marginTop: "2px" }}>
+                                {selectedEvidenceAlert.confidence_score ? `${(selectedEvidenceAlert.confidence_score * 100).toFixed(0)}%` : "N/A"}
+                              </div>
+                            </div>
+                          ) : (
+                            <div style={{ background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-glass)", padding: "10px 14px", borderRadius: "6px", textAlign: "center" }}>
+                              <div style={{ fontSize: "0.65rem", color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>Gemini AI</div>
+                              <div style={{ fontSize: "1.2rem", fontWeight: 800, color: "var(--primary)", marginTop: "2px" }}>
+                                {selectedEvidenceAlert.confidence_score ? `${(selectedEvidenceAlert.confidence_score * 100).toFixed(0)}%` : "N/A"}
+                              </div>
+                            </div>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                    <div style={{ flex: 1, background: "rgba(255,255,255,0.02)", border: "1px solid var(--border-glass)", padding: "8px 12px", borderRadius: "6px", textAlign: "center" }}>
-                      <div style={{ fontSize: "0.62rem", color: "var(--text-muted)" }}>Gemini AI</div>
-                      <div style={{ fontSize: "1.1rem", fontWeight: 800, color: "var(--primary)", marginTop: "2px" }}>
-                        {selectedEvidenceAlert.threat_description.includes("[Not Gemini Verified]") ? "N/A" : (selectedEvidenceAlert.confidence_score ? `${(selectedEvidenceAlert.confidence_score * 100).toFixed(0)}%` : "N/A")}
-                      </div>
-                    </div>
-                  </div>
-                </div>
+                    </>
+                  );
+                })()}
 
                 <div style={{ flex: 1 }}></div>
 
@@ -3037,25 +2859,13 @@ export default function ProjectView() {
                     Download Raw Evidence (JPEG)
                   </button>
                   <div style={{ display: "flex", gap: "10px" }}>
-                    {!selectedEvidenceAlert.is_resolved && (
-                      <button 
-                        onClick={() => {
-                          handleResolveAlert(selectedEvidenceAlert.id);
-                          setSelectedEvidenceAlert(null);
-                        }}
-                        className="btn-secondary"
-                        style={{ flex: 1, justifyContent: "center", background: "var(--success)", borderColor: "var(--success)" }}
-                      >
-                        Resolve
-                      </button>
-                    )}
                     <button 
                       onClick={() => {
                         handleTrashAlert(selectedEvidenceAlert.id);
                         setSelectedEvidenceAlert(null);
                       }}
                       className="btn-secondary"
-                      style={{ flex: 1, justifyContent: "center", background: "rgba(239, 68, 68, 0.1)", borderColor: "rgba(239, 68, 68, 0.25)", color: "var(--danger)" }}
+                      style={{ width: "100%", justifyContent: "center", padding: "10px", background: "rgba(239, 68, 68, 0.1)", borderColor: "rgba(239, 68, 68, 0.25)", color: "var(--danger)" }}
                     >
                       Move to Trash
                     </button>

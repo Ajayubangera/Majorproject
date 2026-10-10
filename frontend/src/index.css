@@ -37,6 +37,11 @@
   padding: 0;
 }
 
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
 body {
   font-family: var(--font-body);
   background-color: var(--bg-primary);
@@ -139,12 +144,14 @@ h1, h2, h3, h4, h5, h6 {
   align-items: center;
   gap: 8px;
   box-shadow: 0 4px 14px 0 var(--primary-glow);
+  text-decoration: none;
 }
 
 .btn-primary:hover {
   transform: translateY(-2px);
   box-shadow: 0 6px 20px 0 var(--primary-glow), 0 0 12px var(--secondary-glow);
   opacity: 0.95;
+  text-decoration: none;
 }
 
 .btn-primary:active {
@@ -164,6 +171,7 @@ h1, h2, h3, h4, h5, h6 {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+  text-decoration: none;
 }
 
 .btn-secondary:hover {

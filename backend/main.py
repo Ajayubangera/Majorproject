@@ -1869,8 +1869,30 @@ async def delete_alert(alert_id: str, db: AsyncSession = Depends(get_db)):
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
     project_id = alert.project_id
+    snapshot_url = alert.snapshot_url
     await db.delete(alert)
     await db.commit()
+
+    # Clean up cloud snapshot from Supabase if present
+    if snapshot_url and SUPABASE_URL and SUPABASE_KEY:
+        try:
+            marker = f"/{SUPABASE_BUCKET}/"
+            if marker in snapshot_url:
+                parts = snapshot_url.split(marker, 1)
+                if len(parts) > 1 and parts[1]:
+                    clean_p = parts[1].split("?")[0]
+                    base = SUPABASE_URL.rstrip('/')
+                    del_url = f"{base}/storage/v1/object/{SUPABASE_BUCKET}"
+                    headers = {
+                        "Authorization": f"Bearer {SUPABASE_KEY}",
+                        "apikey": SUPABASE_KEY,
+                        "Content-Type": "application/json"
+                    }
+                    async with httpx.AsyncClient(timeout=10.0) as client:
+                        await client.request("DELETE", del_url, headers=headers, json={"prefixes": [clean_p]})
+        except Exception as e:
+            print(f"[Supabase Storage] Error deleting snapshot for alert {alert_id}: {e}")
+
     # Broadcast permanent delete event
     await manager.broadcast(project_id, {
         "event": "alert_permanently_deleted",
@@ -1883,9 +1905,35 @@ async def delete_all_trash_alerts(project_id: str, db: AsyncSession = Depends(ge
     result = await db.execute(select(Alert).where(Alert.project_id == project_id, Alert.is_trashed == True))
     alerts = result.scalars().all()
     count = len(alerts)
+    snapshot_urls = [a.snapshot_url for a in alerts if a.snapshot_url]
     for alert in alerts:
         await db.delete(alert)
     await db.commit()
+
+    if snapshot_urls and SUPABASE_URL and SUPABASE_KEY:
+        try:
+            prefixes_to_delete = []
+            marker = f"/{SUPABASE_BUCKET}/"
+            for url in snapshot_urls:
+                if marker in url:
+                    parts = url.split(marker, 1)
+                    if len(parts) > 1 and parts[1]:
+                        prefixes_to_delete.append(parts[1].split("?")[0])
+            if prefixes_to_delete:
+                base = SUPABASE_URL.rstrip('/')
+                del_url = f"{base}/storage/v1/object/{SUPABASE_BUCKET}"
+                headers = {
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "apikey": SUPABASE_KEY,
+                    "Content-Type": "application/json"
+                }
+                async with httpx.AsyncClient(timeout=15.0) as client:
+                    for i in range(0, len(prefixes_to_delete), 100):
+                        batch = prefixes_to_delete[i:i + 100]
+                        await client.request("DELETE", del_url, headers=headers, json={"prefixes": batch})
+        except Exception as e:
+            print(f"[Supabase Storage] Error cleaning trash snapshots: {e}")
+
     # Broadcast empty trash event
     await manager.broadcast(project_id, {
         "event": "all_trash_deleted"

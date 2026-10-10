@@ -313,18 +313,18 @@ export default function AuthPage() {
         </div>
 
         {/* Title & Subtitle */}
-        <h2 style={{ textAlign: "center", fontSize: "2rem", marginBottom: "8px", fontWeight: 700 }}>
+        <h2 style={{ textAlign: "center", fontSize: "2rem", marginBottom: (authMode === "login" || authMode === "register") ? "24px" : "8px", fontWeight: 700 }}>
           {authMode === "forgot" && "Forgot Password"}
           {authMode === "reset" && "Reset Password"}
           {authMode === "login" && "Aegis Guard"}
           {authMode === "register" && "Create Account"}
         </h2>
-        <p style={{ textAlign: "center", color: "var(--text-secondary)", marginBottom: "32px", fontSize: "0.9rem" }}>
-          {authMode === "forgot" && "Enter your registered email to receive a recovery link"}
-          {authMode === "reset" && "Set a new secure password for your account"}
-          {authMode === "login" && "AI-Powered Video Analytics & Surveillance Gateway"}
-          {authMode === "register" && "Register organization to start ingestion pipeline"}
-        </p>
+        {(authMode === "forgot" || authMode === "reset") && (
+          <p style={{ textAlign: "center", color: "var(--text-secondary)", marginBottom: "32px", fontSize: "0.9rem" }}>
+            {authMode === "forgot" && "Enter your registered email to receive a recovery link"}
+            {authMode === "reset" && "Set a new secure password for your account"}
+          </p>
+        )}
 
         {/* Tab switchers for Login/Register */}
         {(authMode === "login" || authMode === "register") && (
@@ -778,16 +778,16 @@ export default function AuthPage() {
                   style={{
                     background: "none",
                     border: "none",
-                    color: "var(--primary)",
+                    color: "#ffffff",
                     cursor: "pointer",
                     fontSize: "0.85rem",
                     fontWeight: 600,
                     padding: 0,
-                    textDecoration: "underline",
+                    textDecoration: "none",
                     transition: "var(--transition)"
                   }}
-                  onMouseEnter={(e) => (e.currentTarget.style.color = "var(--primary-hover, #818cf8)")}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = "var(--primary)")}
+                  onMouseEnter={(e) => (e.currentTarget.style.opacity = "0.8")}
+                  onMouseLeave={(e) => (e.currentTarget.style.opacity = "1")}
                 >
                   Forgot Password?
                 </button>

@@ -77,11 +77,36 @@ export default function ProjectNew() {
         {/* Navigation back */}
         <button 
           onClick={() => navigate("/dashboard")} 
-          className="btn-secondary" 
-          style={{ marginBottom: "32px", padding: "8px 16px", fontSize: "0.85rem" }}
+          style={{ 
+            marginBottom: "32px",
+            padding: "8px 18px",
+            fontSize: "0.85rem",
+            background: "linear-gradient(135deg, #8b5cf6, #6d28d9)",
+            color: "#fff",
+            border: "1px solid rgba(167, 139, 250, 0.4)",
+            borderRadius: "var(--radius-md)",
+            fontFamily: "var(--font-display)",
+            fontWeight: 600,
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "8px",
+            cursor: "pointer",
+            boxShadow: "0 4px 14px rgba(139, 92, 246, 0.35)",
+            transition: "var(--transition)"
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.transform = "translateY(-2px)";
+            e.currentTarget.style.boxShadow = "0 6px 20px rgba(139, 92, 246, 0.55)";
+            e.currentTarget.style.opacity = "0.95";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.transform = "translateY(0)";
+            e.currentTarget.style.boxShadow = "0 4px 14px rgba(139, 92, 246, 0.35)";
+            e.currentTarget.style.opacity = "1";
+          }}
         >
           <ArrowLeft size={16} />
-          Back to Hub
+          Back
         </button>
 
         <div style={{ display: "flex", alignItems: "center", gap: "16px", marginBottom: "32px" }}>
@@ -94,8 +119,7 @@ export default function ProjectNew() {
             <FolderPlus size={24} color="#fff" />
           </div>
           <div>
-            <h1 style={{ fontSize: "1.6rem", fontWeight: 700 }}>Initialize Project Blueprint</h1>
-            <p style={{ color: "var(--text-secondary)", fontSize: "0.85rem", marginTop: "2px" }}>Define workspace environments to configure specific AI intelligence models</p>
+            <h1 style={{ fontSize: "1.6rem", fontWeight: 700 }}>Project Blueprint</h1>
           </div>
         </div>
 
