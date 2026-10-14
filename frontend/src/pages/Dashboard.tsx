@@ -1745,11 +1745,8 @@ export default function Dashboard() {
               <div>
                 <h3 style={{ fontSize: "1.2rem", fontWeight: 700, display: "flex", alignItems: "center", gap: "8px", color: "var(--danger)" }}>
                   <Trash2 size={20} />
-                  Workspace Trash Bin
+                  Trash Bin
                 </h3>
-                <p style={{ color: "var(--text-secondary)", fontSize: "0.75rem", marginTop: "2px" }}>
-                  Recover logs or permanently purge them from database
-                </p>
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
                 {projectTrashedAlerts.length > 0 && (
