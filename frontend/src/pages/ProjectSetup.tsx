@@ -473,7 +473,7 @@ export default function ProjectSetup() {
 
       if (!response.ok) throw new Error("Failed to save camera.");
       const data = await response.json();
-      setTestResult({ type: "success", text: `${data.message} Ingestion started.` });
+      setTestResult({ type: "success", text: `${data.message || "Your camera has been saved"} successfully.` });
       if (data.camera) {
         setCameras(prev => [...prev, data.camera]);
       } else {

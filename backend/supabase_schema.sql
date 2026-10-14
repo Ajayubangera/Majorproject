@@ -73,3 +73,28 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS ix_alerts_project_id ON alerts(project_id);
 CREATE INDEX IF NOT EXISTS ix_alerts_camera_id ON alerts(camera_id);
 CREATE INDEX IF NOT EXISTS ix_alerts_created_at ON alerts(created_at DESC);
+
+-- 7. User Cascade Deletion Trigger
+-- When a user is deleted from Supabase:
+-- Automatically deletes all projects owned by that user (which cascades to cameras, members, and alerts)
+-- Also deletes any membership records where that user is a member of other projects.
+CREATE OR REPLACE FUNCTION delete_user_cascading_data()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Delete all projects owned by this user (by owner_id matching user.id or user.email)
+    -- Deleting projects automatically CASCADE deletes cameras, project_members, and alerts!
+    DELETE FROM projects WHERE owner_id = OLD.id OR owner_id = OLD.email;
+    
+    -- Delete any member invitations/roles for this user in other projects
+    DELETE FROM project_members WHERE LOWER(email) = LOWER(OLD.email);
+    
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_cascade_delete_user ON users;
+CREATE TRIGGER trg_cascade_delete_user
+BEFORE DELETE ON users
+FOR EACH ROW
+EXECUTE FUNCTION delete_user_cascading_data();
+

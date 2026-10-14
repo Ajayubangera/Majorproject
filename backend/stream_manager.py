@@ -225,10 +225,10 @@ class CameraStreamWorker:
         self._running = False
         self._inference_trigger.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=1.0)
             self._thread = None
         if self._inference_thread:
-            self._inference_thread.join(timeout=5)
+            self._inference_thread.join(timeout=1.0)
             self._inference_thread = None
         print(f"[StreamManager] Stopped worker for camera '{self.camera_name}' ({self.camera_id[:8]})")
 

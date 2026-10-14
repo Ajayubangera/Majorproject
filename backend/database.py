@@ -245,6 +245,47 @@ async def init_db():
                         pass
 
             await conn.run_sync(check_and_add_indexes_columns)
+
+            # Install User-Level Cascade Deletion Trigger
+            # Ensures deleting a user automatically cascades to all their projects, cameras, members, and alerts!
+            try:
+                from sqlalchemy import text
+                if "postgresql" in DATABASE_URL:
+                    await conn.execute(text("""
+                        CREATE OR REPLACE FUNCTION delete_user_cascading_data()
+                        RETURNS TRIGGER AS $$
+                        BEGIN
+                            -- 1. Delete all projects owned by this user
+                            DELETE FROM projects WHERE owner_id = OLD.id OR owner_id = OLD.email;
+                            
+                            -- 2. Delete any member invitations/roles for this user in other projects
+                            DELETE FROM project_members WHERE LOWER(email) = LOWER(OLD.email);
+                            
+                            RETURN OLD;
+                        END;
+                        $$ LANGUAGE plpgsql;
+                    """))
+                    await conn.execute(text("DROP TRIGGER IF EXISTS trg_cascade_delete_user ON users;"))
+                    await conn.execute(text("""
+                        CREATE TRIGGER trg_cascade_delete_user
+                        BEFORE DELETE ON users
+                        FOR EACH ROW
+                        EXECUTE FUNCTION delete_user_cascading_data();
+                    """))
+                    print("[Database] Verified PostgreSQL cascade deletion trigger on 'users'.")
+                else:
+                    await conn.execute(text("""
+                        CREATE TRIGGER IF NOT EXISTS trg_cascade_delete_user_projects
+                        BEFORE DELETE ON users
+                        FOR EACH ROW
+                        BEGIN
+                            DELETE FROM projects WHERE owner_id = OLD.id OR owner_id = OLD.email;
+                            DELETE FROM project_members WHERE LOWER(email) = LOWER(OLD.email);
+                        END;
+                    """))
+            except Exception as trg_err:
+                print(f"[Database] Warning setting up cascade trigger: {trg_err}")
+
         except Exception as e:
             print(f"Migration warning: {e}")
 

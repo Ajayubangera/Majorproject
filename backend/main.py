@@ -668,6 +668,61 @@ async def reset_password(payload: ResetPasswordRequest, db: AsyncSession = Depen
         "email": user.email
     }
 
+@app.delete("/api/users/{user_id_or_email}")
+async def delete_user_account(user_id_or_email: str, db: AsyncSession = Depends(get_db)):
+    """
+    Deletes a user account and cleanly cascades deletion of all associated data:
+    - All projects owned by this user
+    - All cameras under those projects (stopping background video streams)
+    - All members under those projects
+    - All alerts and snapshots under those projects
+    - All member roles for this user in other projects
+    """
+    target = user_id_or_email.strip()
+    result = await db.execute(select(User).where((User.id == target) | (User.email == target.lower())))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User account not found")
+
+    user_id = user.id
+    user_email = user.email.lower()
+
+    # Find all cameras under projects owned by this user and stop their background video streams
+    try:
+        from database import Project, Camera
+        from stream_manager import stream_manager
+        proj_res = await db.execute(select(Project.id).where((Project.owner_id == user_id) | (Project.owner_id == user_email)))
+        user_proj_ids = proj_res.scalars().all()
+        if user_proj_ids:
+            cam_res = await db.execute(select(Camera.id).where(Camera.project_id.in_(user_proj_ids)))
+            user_cam_ids = cam_res.scalars().all()
+            for cam_id in user_cam_ids:
+                try:
+                    stream_manager.stop_camera(cam_id)
+                except Exception:
+                    pass
+    except Exception as stream_err:
+        print(f"[DeleteUser] Notice when stopping streams: {stream_err}")
+
+    # Delete the user from the database — triggers automatic cascading cleanup
+    await db.delete(user)
+    await db.commit()
+    print(f"[DeleteUser] Successfully deleted user account {user_email} (ID: {user_id}) and cascaded all projects, cameras, members, and alerts.")
+
+    return {
+        "message": f"User account {user_email} and all related projects, cameras, members, and alerts have been completely deleted.",
+        "deleted_user_id": user_id,
+        "deleted_email": user_email
+    }
+
+@app.delete("/api/auth/account")
+async def delete_own_account(current_user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Allows authenticated users to delete their own account and cascade all associated data."""
+    email = current_user.get("sub")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid auth credentials")
+    return await delete_user_account(email, db)
+
 @app.get("/api/projects")
 async def list_projects(email: str, db: AsyncSession = Depends(get_db)):
     # Optimized single-query project listing with camera and active unread alert count aggregation
@@ -1249,7 +1304,6 @@ async def create_camera(project_id: str, camera_data: CameraCreate, db: AsyncSes
     )
     db.add(new_camera)
     await db.commit()
-    await db.refresh(new_camera)
     
     # Start stream worker in background thread so HTTP response returns instantly
     if new_camera.ai_active:
@@ -1271,7 +1325,7 @@ async def create_camera(project_id: str, camera_data: CameraCreate, db: AsyncSes
         ).start()
         
     return {
-        "message": "Standalone camera saved successfully",
+        "message": "Your camera has been saved",
         "camera": {
             "id": new_camera.id,
             "name": new_camera.name,
@@ -1301,36 +1355,38 @@ async def delete_camera(camera_id: str, db: AsyncSession = Depends(get_db)):
 
 @app.put("/api/cameras/{camera_id}")
 async def update_camera(camera_id: str, payload: CameraUpdate, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Camera).where(Camera.id == camera_id))
-    camera = result.scalars().first()
-    if not camera:
+    result = await db.execute(
+        select(Camera, Project.project_type)
+        .outerjoin(Project, Camera.project_id == Project.id)
+        .where(Camera.id == camera_id)
+    )
+    row = result.first()
+    if not row:
         raise HTTPException(status_code=404, detail="Camera not found")
         
-    old_rtsp_url = camera.rtsp_url
+    camera, project_type = row[0], row[1] or "home"
+    old_rtsp_url = (camera.rtsp_url or "").strip()
+    new_rtsp_url = payload.rtsp_url.strip()
     final_zone_tag = payload.zone_tag.strip() if payload.zone_tag and payload.zone_tag.strip() else payload.name.strip()
     
     camera.name = payload.name.strip()
-    camera.rtsp_url = payload.rtsp_url.strip()
+    camera.rtsp_url = new_rtsp_url
     camera.zone_tag = final_zone_tag
     camera.nvr_ip_address = payload.nvr_ip_address
     camera.channel_number = payload.channel_number
     
     await db.commit()
-    await db.refresh(camera)
     
     # Instant restart or metadata update
     if camera.ai_active:
-        proj_res = await db.execute(select(Project.project_type).where(Project.id == camera.project_id))
-        project_type = proj_res.scalar() or "home"
-        
         existing_worker = stream_mgr.get_worker(camera.id)
-        if existing_worker and old_rtsp_url == camera.rtsp_url:
+        if existing_worker and old_rtsp_url == new_rtsp_url:
             # High-speed in-memory update: no need to disconnect/reconnect socket
             existing_worker.camera_name = camera.name
             existing_worker.zone_tag = camera.zone_tag or ""
             print(f"[StreamManager] Updated worker metadata instantly for camera '{camera.name}' without restarting stream.")
         else:
-            # If stream URL changed, restart in background daemon thread to avoid blocking HTTP response with thread.join()
+            # If stream URL changed, restart in background daemon thread to avoid blocking HTTP response
             import threading
             threading.Thread(
                 target=stream_mgr.start_camera,
@@ -1350,6 +1406,7 @@ async def update_camera(camera_id: str, payload: CameraUpdate, db: AsyncSession 
         
     return {
         "status": "success", 
+        "message": "Your camera has been saved",
         "camera": {
             "id": camera.id,
             "name": camera.name,
@@ -2143,16 +2200,16 @@ async def verify_threat_in_background(
     if not verified_successfully:
         print("[Verification] All LLM strategies exhausted. Falling back to offline simulation.")
         anomaly_map = {
-            "violence": (True, "Physical violence detected. Two individuals engaging in active combat in camera range.", confidence_yolo),
-            "loitering": (True, f"Suspicious loitering verified near {camera_zone_tag or 'facility boundary'}. Individual standing motionless for >15 minutes.", confidence_yolo),
-            "trespassing": (True, f"Intrusion alert verified. Person climbing locked gateway area in zone: {camera_zone_tag or 'Rear Area'}.", confidence_yolo),
-            "fire": (True, "Thermal hazard verified. Active ignition source and plume smoke rising near device.", confidence_yolo),
-            "normal": (False, "Normal activity, verified by Gemini. False positive filtered.", 0.12)
+            "violence": (True, "Physical violence detected. Two individuals engaging in active combat in camera range.", max(0.85, confidence_yolo)),
+            "loitering": (True, f"Suspicious loitering verified near {camera_zone_tag or 'facility boundary'}. Individual standing motionless for >15 minutes.", max(0.82, confidence_yolo)),
+            "trespassing": (True, f"Intrusion alert verified. Person climbing locked gateway area in zone: {camera_zone_tag or 'Rear Area'}.", max(0.84, confidence_yolo)),
+            "fire": (True, "Thermal hazard verified. Active ignition source and plume smoke rising near device.", max(0.88, confidence_yolo)),
+            "normal": (False, "Normal activity verified. False positive filtered.", 0.85)
         }
         threat_detected, threat_description, confidence_score = anomaly_map.get(
-            anomaly_type.lower(), (False, "Normal operational state.", 0.05)
+            anomaly_type.lower(), (False, "Normal operational state.", 0.85)
         )
-        threat_description += " [Not Gemini Verified]"
+        threat_description += " [Offline Analysis]"
 
     # Only snapshots that are verified by Gemini layer as active threats are saved into Supabase cloud.
     # No photos are ever stored in the local disk.

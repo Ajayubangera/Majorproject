@@ -14,88 +14,97 @@ export interface ViolenceConfig {
 }
 
 /**
- * Determines the violence / threat level of an alert snapshot:
- * - 'high' (Red): Physical violence, fighting, combat, fire hazard, weapons, assault, or high-confidence AI threat detections (>= 75%).
- * - 'medium' (Orange): Loitering, trespassing, intrusion, running, phone use, or mid-confidence detections (25% - 75%).
- * - 'low' (Green): Normal monitoring scenario, clear environment, false positive filtered, or low confidence (< 25%).
+ * Determines the threat / violence level of an alert:
+ * 
+ * 1. 'low' (Normal / Green):
+ *    - Explicitly normal operational state, normal indoor/outdoor setting, routine movement.
+ *    - Gemini descriptions with "no indication of", "no threat", "no weapon", "no violence", "false positive".
+ * 
+ * 2. 'high' (High Threat / Red):
+ *    - Lethal weapons (knife, blade, dagger, gun, firearm, weapon, cutting tool).
+ *    - Active physical violence (fighting, combat, assault, physical violence, brawl).
+ *    - Extreme hazards (fire, thermal hazard, explosion, arson).
+ *    - ONLY when not negated by negative phrases.
+ * 
+ * 3. 'medium' (Medium Threat / Orange):
+ *    - Suspicious & policy-violating behaviors without weapons:
+ *    - Loitering, running, trespassing, unauthorized perimeter intrusion, climbing, prohibited phone use.
  */
 export function getViolenceLevel(alert: any): ViolenceLevel {
   if (!alert) return "low";
 
   const anomaly = (alert.anomaly_type || "").toLowerCase().trim();
   const desc = (alert.threat_description || "").toLowerCase().trim();
-  const conf = typeof alert.confidence_score === "number" ? alert.confidence_score : 0;
 
-  // 1. Explicit Normal / Safe check
-  const isNormalText = 
-    desc.includes("normal operational") || 
-    desc.includes("normal monitoring") || 
-    desc.includes("normal activity") || 
-    desc.includes("clear environment") || 
-    desc.includes("no active threat") || 
-    desc.includes("false positive") || 
-    desc.includes("no threat") ||
-    desc.includes("clear scene");
+  // ─── Step 1: Explicit Normal / Safe Environment & Negation Checks (Top Priority) ───
+  // Gemini descriptions frequently say:
+  // - "There are no indicators of violence, unauthorized intrusion, weapons, fire/smoke, or suspicious loitering."
+  // - "There are no visible signs of violence, weapons, fire/smoke..."
+  // - "...which does not constitute a threat."
+  // These must be recognized as SAFE / NORMAL (low), NOT as affirmative weapons!
 
-  if (anomaly === "normal" || anomaly === "safe" || anomaly === "none" || (isNormalText && conf < 0.35)) {
+  const negationRegex = /\b(no|without|neither|not any|free of|devoid of)\s+([a-z]+\s+)?(indicator|indicators|indication|indications|sign|signs|evidence|threat|trace|traces)\b/i;
+  const threatNegationRegex = /\b(not|does not|do not|doesn't|don't)\s+(constitute|indicate|suggest|appear to be|seem to be|represent)\s+(a\s+|an\s+|any\s+)?(threat|danger|hazard|anomaly|concern)\b/i;
+  const explicitSafeRegex = /\b(normal|routine|safe|casual|harmless|peaceful|clear)\s+(room|indoor|outdoor|setting|environment|state|activity|scene|operation|monitoring)\b/i;
+
+  const normalIndicatorPhrases = [
+    "normal operational", "normal operational state", "normal activity",
+    "normal room", "normal monitoring", "normal environment", "normal setting", "normal state",
+    "offline analysis", "not gemini verified", "offline simulation",
+    "no indicator", "no indicators", "no indication", "no indications",
+    "no visible sign", "no visible signs", "no sign", "no signs",
+    "no evidence", "no threat", "no active threat", "no malicious",
+    "not a threat", "not constitute a threat", "does not constitute a threat",
+    "casually looking", "looking around", "looking upwards",
+    "false positive", "harmless", "routine activity", "simply posing"
+  ];
+
+  const isSafeContext = 
+    desc.includes("normal operational") ||
+    desc.includes("offline analysis") ||
+    desc.includes("normal state") ||
+    negationRegex.test(desc) || 
+    threatNegationRegex.test(desc) || 
+    explicitSafeRegex.test(desc) ||
+    normalIndicatorPhrases.some(p => desc.includes(p)) ||
+    ["normal", "safe", "none"].includes(anomaly);
+
+  // If the context is explicitly safe or negated, ONLY an explicit affirmative weapon in hand can override to high
+  if (isSafeContext) {
+    const affirmativeHighActions = [
+      "holding a knife", "carrying a knife", "brandishing a knife", "armed with a knife", "knife in hand",
+      "holding a gun", "carrying a gun", "brandishing a gun", "armed with a gun", "gun in hand",
+      "holding a weapon", "carrying a weapon", "active physical fight", "active combat", "active shooting"
+    ];
+    if (affirmativeHighActions.some(action => desc.includes(action))) {
+      return "high";
+    }
+    // Safe / routine environment -> Low (Normal / Safe)
     return "low";
   }
 
-  // 2. High Violence / Severe Threat Keywords
+  // ─── Step 2: High Threat Category (Weapons & Physical Violence ONLY) ───
   const highKeywords = [
-    "violence", 
-    "fighting", 
-    "fight", 
-    "combat", 
-    "assault", 
-    "attack", 
-    "weapon", 
-    "gun", 
-    "knife", 
-    "fire", 
-    "thermal hazard", 
-    "ignition", 
-    "robbery", 
-    "active combat", 
-    "physical violence"
+    "knife", "blade", "dagger", "machete", "gun", "firearm", "pistol", "rifle",
+    "weapon", "fighting", "physical fight", "combat", "active combat", "assault",
+    "physical violence", "active violence", "punching", "kicking", "brawl",
+    "fire", "thermal hazard", "arson", "explosion"
   ];
-  const isHighAnomaly = highKeywords.some(k => anomaly.includes(k));
-  const isHighDesc = highKeywords.some(k => desc.includes(k));
-
-  if (isHighAnomaly || isHighDesc) {
+  if (highKeywords.some(k => anomaly.includes(k) || desc.includes(k))) {
     return "high";
   }
 
-  // 3. Medium Violence / Suspicious Activity Keywords
+  // ─── Step 3: Medium Threat Category (Loitering, Running, Intrusion, Phone) ───
   const mediumKeywords = [
-    "loitering", 
-    "trespassing", 
-    "intrusion", 
-    "climbing", 
-    "running", 
-    "phone_use", 
-    "talking", 
-    "looking_sideways", 
-    "suspicious", 
-    "unauthorized", 
-    "abnormal", 
-    "motionless", 
-    "perimeter"
+    "loitering", "loiter", "running", "run", "sprint", "fleeing",
+    "trespassing", "intrusion", "unauthorized", "phone_use", "phone", "mobile phone",
+    "climbing", "pacing"
   ];
-  const isMediumAnomaly = mediumKeywords.some(k => anomaly.includes(k));
-  const isMediumDesc = mediumKeywords.some(k => desc.includes(k));
-
-  if (isMediumAnomaly || isMediumDesc) {
+  if (mediumKeywords.some(k => anomaly.includes(k) || desc.includes(k))) {
     return "medium";
   }
 
-  // 4. Fallback based on confidence score & status
-  if (conf >= 0.75 && !isNormalText) {
-    return "high";
-  } else if (conf >= 0.25 && !isNormalText) {
-    return "medium";
-  }
-
+  // ─── Step 4: Default Fallback to Normal ───
   return "low";
 }
 
@@ -107,7 +116,7 @@ export function getViolenceConfig(level: ViolenceLevel): ViolenceConfig {
     case "high":
       return {
         level: "high",
-        label: "High Violence",
+        label: "High Threat",
         shortLabel: "High",
         color: "#ef4444",
         border: "rgba(239, 68, 68, 0.35)",
@@ -119,7 +128,7 @@ export function getViolenceConfig(level: ViolenceLevel): ViolenceConfig {
     case "medium":
       return {
         level: "medium",
-        label: "Medium Violence",
+        label: "Medium Threat",
         shortLabel: "Medium",
         color: "#f97316",
         border: "rgba(249, 115, 22, 0.35)",
@@ -132,7 +141,7 @@ export function getViolenceConfig(level: ViolenceLevel): ViolenceConfig {
     default:
       return {
         level: "low",
-        label: "No Violence",
+        label: "Normal / Safe",
         shortLabel: "Normal",
         color: "#10b981",
         border: "rgba(16, 185, 129, 0.25)",

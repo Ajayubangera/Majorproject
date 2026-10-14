@@ -2,6 +2,7 @@ import os
 import sys
 import smtplib
 import asyncio
+import time
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -41,6 +42,15 @@ class EmailService:
 
     def __init__(self):
         self._load_config()
+        # Per-camera email alert cooldowns:
+        # High Threat: 10s cooldown
+        # Medium Threat: 15s cooldown
+        self.alert_cooldowns = {
+            "high": 10.0,
+            "medium": 15.0
+        }
+        self._last_email_sent_time: Dict[str, float] = {}
+        self._cooldown_lock = asyncio.Lock()
 
     def _load_config(self):
         self.smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
@@ -133,15 +143,36 @@ class EmailService:
         threat_description: str,
         confidence_score: float,
         snapshot_url: str,
-        timestamp: Optional[datetime] = None
+        timestamp: Optional[datetime] = None,
+        threat_level: str = "medium"
     ) -> Dict[str, str]:
-        """Formats the HTML and Plain Text alert templates with all incident details."""
+        """Formats the HTML and Plain Text alert templates with all incident details tailored by severity."""
         time_info = self.format_timestamp_display(timestamp)
         confidence_pct = f"{confidence_score * 100:.1f}%" if confidence_score <= 1.0 else f"{confidence_score:.1f}%"
         anomaly_display = anomaly_type.replace("_", " ").title()
         zone_display = zone_tag or "Monitored Zone"
 
-        subject = f"🚨 [SECURITY ALERT] Unusual Activity Detected: {anomaly_display} - {camera_name} ({zone_display})"
+        is_high = threat_level.lower() == "high"
+        if is_high:
+            subject = f"🚨 [HIGH THREAT ALERT] Urgent: {anomaly_display} Flagged at {zone_display} ({project_name})"
+            header_title = "High Threat Alert"
+            badge_text = "HIGH THREAT LEVEL (CRITICAL)"
+            header_bg = "linear-gradient(135deg, #b91c1c 0%, #7f1d1d 100%)"
+            badge_bg = "rgba(0, 0, 0, 0.45)"
+            summary_bg = "rgba(220, 38, 38, 0.15)"
+            summary_border = "#ef4444"
+            summary_text = "#fca5a5"
+            severity_label = '<span style="color: #ef4444; font-weight: 800; background: rgba(239, 68, 68, 0.2); padding: 2px 8px; border-radius: 4px;">HIGH (CRITICAL)</span>'
+        else:
+            subject = f"⚠️ [SECURITY ALERT] Suspicious Activity: {anomaly_display} Flagged at {zone_display} ({project_name})"
+            header_title = "Security Alert Notification"
+            badge_text = "MEDIUM THREAT LEVEL (VERIFIED)"
+            header_bg = "linear-gradient(135deg, #ea580c 0%, #c2410c 100%)"
+            badge_bg = "rgba(0, 0, 0, 0.35)"
+            summary_bg = "rgba(234, 88, 12, 0.15)"
+            summary_border = "#f97316"
+            summary_text = "#fed7aa"
+            severity_label = '<span style="color: #f97316; font-weight: 800; background: rgba(249, 115, 22, 0.2); padding: 2px 8px; border-radius: 4px;">MEDIUM</span>'
 
         # HTML Template
         html = f"""<!DOCTYPE html>
@@ -168,7 +199,7 @@ class EmailService:
       box-shadow: 0 10px 30px rgba(0,0,0,0.6);
     }}
     .header {{
-      background: linear-gradient(135deg, #e11d48 0%, #9333ea 100%);
+      background: {header_bg};
       padding: 24px;
       text-align: center;
     }}
@@ -184,25 +215,25 @@ class EmailService:
       display: inline-block;
       margin-top: 8px;
       padding: 4px 12px;
-      background: rgba(0, 0, 0, 0.35);
+      background: {badge_bg};
       border-radius: 20px;
       font-size: 12px;
       font-weight: 700;
-      color: #ffd1dc;
+      color: #ffffff;
       letter-spacing: 0.5px;
     }}
     .content {{
       padding: 24px;
     }}
     .alert-summary {{
-      background: rgba(225, 29, 72, 0.12);
-      border-left: 4px solid #e11d48;
+      background: {summary_bg};
+      border-left: 4px solid {summary_border};
       padding: 14px 18px;
       border-radius: 6px;
       margin-bottom: 24px;
       font-size: 14px;
       line-height: 1.5;
-      color: #fecdd3;
+      color: {summary_text};
     }}
     .details-table {{
       width: 100%;
@@ -291,18 +322,22 @@ class EmailService:
 <body>
   <div class="container">
     <div class="header">
-      <h1>Security Alert Notification</h1>
-      <div class="badge">Unusual Activity Verified by AI</div>
+      <h1>{header_title}</h1>
+      <div class="badge">{badge_text}</div>
     </div>
     <div class="content">
       <div class="alert-summary">
-        <strong>⚠️ Incident Detected:</strong> Unusual activity (<strong>{anomaly_display}</strong>) has been flagged by edge analytics and verified at <strong>{zone_display}</strong>.
+        <strong>⚠️ Incident Verified:</strong> Activity (<strong>{anomaly_display}</strong>) has been flagged by edge analytics and verified at <strong>{zone_display}</strong>.
       </div>
 
       <table class="details-table">
         <tr>
+          <td class="label">Severity Level</td>
+          <td class="value">{severity_label}</td>
+        </tr>
+        <tr>
           <td class="label">Incident Type</td>
-          <td class="value"><span style="color: #f43f5e; font-weight: 700;">{anomaly_display}</span></td>
+          <td class="value"><span style="color: #ffffff; font-weight: 700;">{anomaly_display}</span></td>
         </tr>
         <tr>
           <td class="label">Camera Name</td>
@@ -396,25 +431,12 @@ Please review the surveillance dashboard immediately.
         plain_content: str,
         image_data: Optional[bytes] = None
     ) -> bool:
-        """Synchronous SMTP worker invoked via asyncio.to_thread."""
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = Header(subject, "utf-8")
-        msg["From"] = f"{Header(self.smtp_from_name, 'utf-8').encode()} <{self.smtp_from_email}>"
-        msg["To"] = ", ".join(to_emails)
-
-        msg.attach(MIMEText(plain_content, "plain", "utf-8"))
-        msg.attach(MIMEText(html_content, "html", "utf-8"))
-
-        # Optional inline image attachment if available
-        if image_data:
-            try:
-                img_part = MIMEImage(image_data, name="threat_snapshot.jpg")
-                img_part.add_header("Content-Disposition", "inline", filename="threat_snapshot.jpg")
-                msg.attach(img_part)
-            except Exception as img_err:
-                safe_log(f"[EmailService] Notice: Could not attach snapshot bytes: {img_err}")
-
+        """
+        Synchronous SMTP worker invoked via asyncio.to_thread.
+        Dispatches individual emails (1 snapshot per email) to each recipient in to_emails.
+        """
         server = None
+        sent_count = 0
         try:
             if self.smtp_use_ssl:
                 server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=15)
@@ -426,9 +448,33 @@ Please review the surveillance dashboard immediately.
             if self.smtp_user and self.smtp_password:
                 server.login(self.smtp_user, self.smtp_password)
 
-            server.sendmail(self.smtp_from_email, to_emails, msg.as_string())
-            safe_log(f"[EmailService] Successfully sent security alert email to {len(to_emails)} recipients: {to_emails}")
-            return True
+            # Send individually: each team member receives their own email with 1 snapshot
+            for recipient in to_emails:
+                try:
+                    indiv_msg = MIMEMultipart("alternative")
+                    indiv_msg["Subject"] = Header(subject, "utf-8")
+                    indiv_msg["From"] = f"{Header(self.smtp_from_name, 'utf-8').encode()} <{self.smtp_from_email}>"
+                    indiv_msg["To"] = recipient
+
+                    indiv_msg.attach(MIMEText(plain_content, "plain", "utf-8"))
+                    indiv_msg.attach(MIMEText(html_content, "html", "utf-8"))
+
+                    # Exactly 1 snapshot image attachment per individual email
+                    if image_data:
+                        try:
+                            img_part = MIMEImage(image_data, name="threat_snapshot.jpg")
+                            img_part.add_header("Content-Disposition", "inline", filename="threat_snapshot.jpg")
+                            indiv_msg.attach(img_part)
+                        except Exception as img_err:
+                            safe_log(f"[EmailService] Notice: Could not attach snapshot bytes for {recipient}: {img_err}")
+
+                    server.sendmail(self.smtp_from_email, [recipient], indiv_msg.as_string())
+                    sent_count += 1
+                except Exception as ind_err:
+                    safe_log(f"[EmailService] Failed delivering email to individual {recipient}: {ind_err}")
+
+            safe_log(f"[EmailService] Successfully sent individual alert emails (1 snapshot each) to {sent_count}/{len(to_emails)} recipient(s): {to_emails}")
+            return sent_count > 0
         except Exception as e:
             safe_log(f"[EmailService] Failed to send SMTP email to {to_emails}: {e}")
             return False
@@ -452,7 +498,8 @@ Please review the surveillance dashboard immediately.
         confidence_score: float,
         snapshot_url: str,
         image_data: Optional[bytes] = None,
-        timestamp: Optional[datetime] = None
+        timestamp: Optional[datetime] = None,
+        threat_level: str = "medium"
     ) -> Dict[str, Any]:
         """
         Dispatches the alert email to all specified recipients.
@@ -479,11 +526,12 @@ Please review the surveillance dashboard immediately.
             threat_description=threat_description,
             confidence_score=confidence_score,
             snapshot_url=snapshot_url,
-            timestamp=timestamp
+            timestamp=timestamp,
+            threat_level=threat_level
         )
 
         if self.is_configured:
-            safe_log(f"[EmailService] Dispatching LIVE email to {cleaned_emails} via {self.smtp_host}:{self.smtp_port}...")
+            safe_log(f"[EmailService] Dispatching LIVE individual email (1 snapshot each) to {cleaned_emails} via {self.smtp_host}:{self.smtp_port}...")
             success = await asyncio.to_thread(
                 self._send_smtp_sync,
                 cleaned_emails,
@@ -497,6 +545,7 @@ Please review the surveillance dashboard immediately.
                 "mode": "live_smtp",
                 "recipients": cleaned_emails,
                 "subject": email_data["subject"],
+                "threat_level": threat_level,
                 "snapshot_url": snapshot_url
             }
         else:
@@ -505,12 +554,13 @@ Please review the surveillance dashboard immediately.
             safe_log("[EmailService SIMULATION] Live SMTP not configured in .env (SMTP_USER/SMTP_PASSWORD empty).")
             safe_log("[EmailService SIMULATION] Dispatched alert notification to Access Management members:")
             safe_log(f"  Recipients:   {cleaned_emails}")
+            safe_log(f"  Severity:     {threat_level.upper()}")
             safe_log(f"  Subject:      {safe_subject}")
             safe_log(f"  Camera:       {camera_name} (ID: {camera_id})")
             safe_log(f"  Area / Zone:  {zone_tag or 'Monitored Zone'}")
             safe_log(f"  Project:      {project_name} ({project_location})")
             safe_log(f"  Anomaly:      {anomaly_type} (Confidence: {confidence_score * 100:.1f}%)")
-            safe_log(f"  S3 Snapshot:  {snapshot_url}")
+            safe_log(f"  S3 Snapshot:  {snapshot_url} (1 snapshot per email)")
             safe_log("  To enable real inbox delivery, configure SMTP_USER & SMTP_PASSWORD in .env")
             safe_log("=" * 80)
             return {
@@ -518,6 +568,7 @@ Please review the surveillance dashboard immediately.
                 "mode": "simulation",
                 "recipients": cleaned_emails,
                 "subject": email_data["subject"],
+                "threat_level": threat_level,
                 "snapshot_url": snapshot_url,
                 "message": "Alert email formatted & logged (configure SMTP_USER in .env for live inbox delivery)"
             }
@@ -533,12 +584,41 @@ Please review the surveillance dashboard immediately.
         confidence_score: float,
         snapshot_url: str,
         image_data: Optional[bytes] = None,
-        timestamp: Optional[datetime] = None
+        timestamp: Optional[datetime] = None,
+        threat_level: str = "medium"
     ) -> Dict[str, Any]:
         """
         Fetches all project members from the database (Access Management section)
-        and sends the alert email with all details, area, camera, and S3 snapshot.
+        and sends individual alert emails with 1 snapshot per email.
+        Enforces strict per-camera anti-flood cooldowns:
+        - High Threat (knife/weapon/fire/violence): 10 seconds cooldown
+        - Medium Threat (loitering/running/phone): 15 seconds cooldown
         """
+        # Enforce exact threat-tier cooldowns: High = 10s, Medium = 15s per camera
+        tier = threat_level.lower()
+        cooldown_duration = self.alert_cooldowns.get(tier, 15.0)
+        cooldown_key = f"{camera_id or project_id}_{tier}"
+        now = time.time()
+
+        async with self._cooldown_lock:
+            last_sent = self._last_email_sent_time.get(cooldown_key, 0.0)
+            elapsed = now - last_sent
+            if elapsed < cooldown_duration:
+                remaining = round(cooldown_duration - elapsed, 1)
+                safe_log(
+                    f"[EmailService] {tier.upper()} threat alert for camera '{camera_name}' "
+                    f"in cooldown ({cooldown_duration}s rule). Next email eligible in {remaining}s. Skipping duplicate dispatch."
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "cooldown_active",
+                    "threat_level": threat_level,
+                    "cooldown_duration_s": cooldown_duration,
+                    "cooldown_remaining_s": remaining,
+                    "recipients": []
+                }
+            self._last_email_sent_time[cooldown_key] = now
+
         from database import AsyncSessionLocal, Project, ProjectMember
         from sqlalchemy import select
 
@@ -628,7 +708,8 @@ Please review the surveillance dashboard immediately.
             confidence_score=confidence_score,
             snapshot_url=snapshot_url,
             image_data=image_data,
-            timestamp=timestamp
+            timestamp=timestamp,
+            threat_level=threat_level
         )
 
     def build_welcome_email_content(

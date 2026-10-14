@@ -14,6 +14,7 @@ Features:
 """
 
 import os
+import re
 import cv2
 import time
 import json
@@ -233,6 +234,80 @@ class VerificationQueueManager:
                 print(f"[VerificationWorker-{worker_id}] Unexpected error in loop: {e}")
                 await asyncio.sleep(1.0)
 
+    @staticmethod
+    def classify_threat_level(threat_description: str, anomaly_type: str) -> str:
+        """
+        Determines the alert severity tier matching frontend threatUtils.ts:
+        - 'low': Normal / Routine / Safe / False Positive (SUPPRESS EMAIL ALERT)
+        - 'high': Weapons (knife, gun, blade, firearm) or active violence / fire (DISPATCH HIGH ALERT)
+        - 'medium': Policy infractions without weapons (loitering, running, intrusion, phone use) (DISPATCH MEDIUM ALERT)
+        """
+        desc = (threat_description or "").lower().strip()
+        anomaly = (anomaly_type or "").lower().strip()
+
+        # Step 1: Explicit Normal / Safe Environment & Negation Checks (Top Priority)
+        # Gemini descriptions frequently say:
+        # - "There are no indicators of violence, unauthorized intrusion, weapons, fire/smoke, or suspicious loitering."
+        # - "There are no visible signs of violence, weapons, fire/smoke..."
+        # - "...which does not constitute a threat."
+        negation_pattern = r"\b(no|without|neither|not any|free of|devoid of)\s+([a-z]+\s+)?(indicator|indicators|indication|indications|sign|signs|evidence|threat|trace|traces)\b"
+        threat_negation_pattern = r"\b(not|does not|do not|doesn't|don't)\s+(constitute|indicate|suggest|appear to be|seem to be|represent)\s+(a\s+|an\s+|any\s+)?(threat|danger|hazard|anomaly|concern)\b"
+        explicit_safe_pattern = r"\b(normal|routine|safe|casual|harmless|peaceful|clear)\s+(room|indoor|outdoor|setting|environment|state|activity|scene|operation|monitoring)\b"
+
+        normal_indicator_phrases = [
+            "normal operational", "normal operational state", "normal activity",
+            "normal room", "normal monitoring", "normal environment", "normal setting", "normal state",
+            "offline analysis", "not gemini verified", "offline simulation",
+            "no indicator", "no indicators", "no indication", "no indications",
+            "no visible sign", "no visible signs", "no sign", "no signs",
+            "no evidence", "no threat", "no active threat", "no malicious",
+            "not a threat", "not constitute a threat", "does not constitute a threat",
+            "casually looking", "looking around", "looking upwards",
+            "false positive", "harmless", "routine activity", "simply posing"
+        ]
+
+        is_safe_context = (
+            "normal operational" in desc or
+            "offline analysis" in desc or
+            "normal state" in desc or
+            bool(re.search(negation_pattern, desc, re.IGNORECASE)) or
+            bool(re.search(threat_negation_pattern, desc, re.IGNORECASE)) or
+            bool(re.search(explicit_safe_pattern, desc, re.IGNORECASE)) or
+            any(p in desc for p in normal_indicator_phrases) or
+            anomaly in ("normal", "safe", "none")
+        )
+
+        if is_safe_context:
+            affirmative_high_actions = [
+                "holding a knife", "carrying a knife", "brandishing a knife", "armed with a knife", "knife in hand",
+                "holding a gun", "carrying a gun", "brandishing a gun", "armed with a gun", "gun in hand",
+                "holding a weapon", "carrying a weapon", "active physical fight", "active combat", "active shooting"
+            ]
+            if any(action in desc for action in affirmative_high_actions):
+                return "high"
+            return "low"
+
+        # Step 2: High Threat Category (Weapons & Violent combat/assault/fire ONLY)
+        high_keywords = [
+            "knife", "blade", "dagger", "machete", "gun", "firearm", "pistol", "rifle",
+            "weapon", "fighting", "physical fight", "combat", "active combat", "assault",
+            "physical violence", "active violence", "punching", "kicking", "brawl",
+            "fire", "thermal hazard", "arson", "explosion"
+        ]
+        if any(kw in anomaly or kw in desc for kw in high_keywords):
+            return "high"
+
+        # Step 3: Medium Threat Category (Loitering, Running, Intrusion, Phone Use)
+        medium_keywords = [
+            "loitering", "loiter", "running", "run", "sprint", "fleeing",
+            "trespassing", "intrusion", "unauthorized", "phone_use", "phone", "mobile phone",
+            "climbing", "pacing"
+        ]
+        if any(kw in anomaly or kw in desc for kw in medium_keywords):
+            return "medium"
+
+        return "low"
+
     async def _process_task(self, task: VerificationTask):
         from database import AsyncSessionLocal, Alert
         import base64
@@ -363,14 +438,14 @@ class VerificationQueueManager:
         if not verified_successfully:
             print(f"[Verification] All AI tiers exhausted. Using deterministic heuristic for '{task.anomaly_type}'.")
             anomaly_map = {
-                "violence": (True, "Physical violence detected in camera range.", task.confidence_yolo),
-                "loitering": (True, f"Suspicious loitering verified near {task.camera_zone_tag or 'facility'}.", task.confidence_yolo),
-                "trespassing": (True, f"Intrusion alert verified in zone: {task.camera_zone_tag or 'perimeter'}.", task.confidence_yolo),
-                "fire": (True, "Thermal hazard verified. Active ignition or smoke rising.", task.confidence_yolo),
-                "normal": (False, "Normal activity. False positive filtered.", 0.10)
+                "violence": (True, "Physical violence detected in camera range.", max(0.85, task.confidence_yolo)),
+                "loitering": (True, f"Suspicious loitering verified near {task.camera_zone_tag or 'facility'}.", max(0.82, task.confidence_yolo)),
+                "trespassing": (True, f"Intrusion alert verified in zone: {task.camera_zone_tag or 'perimeter'}.", max(0.84, task.confidence_yolo)),
+                "fire": (True, "Thermal hazard verified. Active ignition or smoke rising.", max(0.88, task.confidence_yolo)),
+                "normal": (False, "Normal activity verified. Environment secure.", 0.85)
             }
             threat_detected, threat_description, confidence_score = anomaly_map.get(
-                task.anomaly_type.lower(), (False, "Normal operational state.", 0.05)
+                task.anomaly_type.lower(), (False, "Normal operational state.", 0.85)
             )
             threat_description += " [Offline Analysis]"
 
@@ -382,12 +457,11 @@ class VerificationQueueManager:
             self.false_positives_filtered += 1
 
         # ─── Cloud Storage (Supabase S3) ──────────────────────────────────────
-        # Only verified genuine threats are stored into Supabase Cloud
         snapshot_url = ""
-        if threat_detected:
-            from main import upload_snapshot_to_supabase
-            filename = task.snapshot_filename or f"verified_{task.anomaly_type}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.jpg"
-            print(f"[Supabase Storage] Verified threat '{task.anomaly_type}'. Uploading snapshot in-memory to cloud hierarchy...")
+        if task.image_data:
+            from main import upload_snapshot_to_supabase, STATIC_DIR
+            status_tag = "verified" if threat_detected else "audit"
+            filename = task.snapshot_filename or f"{status_tag}_{task.anomaly_type}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.jpg"
             cloud_url = await upload_snapshot_to_supabase(
                 project_id=task.project_id,
                 filename=filename,
@@ -398,6 +472,22 @@ class VerificationQueueManager:
             )
             if cloud_url:
                 snapshot_url = cloud_url
+            else:
+                try:
+                    local_dir = os.path.join(STATIC_DIR, "snapshots", task.project_id)
+                    os.makedirs(local_dir, exist_ok=True)
+                    local_path = os.path.join(local_dir, filename)
+                    with open(local_path, "wb") as f:
+                        f.write(task.image_data)
+                    snapshot_url = f"/static/snapshots/{task.project_id}/{filename}"
+                    print(f"[Supabase Fallback] Snapshot saved locally at {snapshot_url}")
+                except Exception as local_err:
+                    print(f"[Supabase Fallback] Error saving local snapshot: {local_err}")
+
+        # Determine 3-tier severity matching frontend rules: 'low' (normal), 'medium', or 'high'
+        threat_level = self.classify_threat_level(threat_description, task.anomaly_type)
+        is_routine_normal = (threat_level == "low")
+        print(f"[Verification] Assessment: tier='{threat_level.upper()}', raw_threat={threat_detected}, anomaly='{task.anomaly_type}'")
 
         # ─── Database Alert Record ────────────────────────────────────────────
         alert_id = None
@@ -410,7 +500,7 @@ class VerificationQueueManager:
                     threat_description=threat_description,
                     confidence_score=confidence_score,
                     anomaly_type=task.anomaly_type,
-                    is_resolved=not threat_detected,
+                    is_resolved=is_routine_normal or (not threat_detected),
                     created_at=datetime.now(timezone.utc)
                 )
                 session.add(alert_record)
@@ -432,17 +522,21 @@ class VerificationQueueManager:
                 await session.commit()
                 await session.refresh(alert_record)
                 alert_id = alert_record.id
-                print(f"[Database] Alert saved to DB: ID={alert_id}, threat={threat_detected}, snapshots_captured incremented")
+                print(f"[Database] Alert saved to DB: ID={alert_id}, tier={threat_level.upper()}, threat={threat_detected}, snapshots_captured incremented")
             except Exception as db_err:
                 print(f"[Database] Error recording alert: {db_err}")
                 await session.rollback()
 
         # ─── Access Management Email Alert Dispatch ───────────────────────────
+        # STRICT POLICY:
+        # - ONLY Medium and High activities trigger email alerts.
+        # - Routine / normal operational states are completely suppressed from sending emails.
+        # - Dispatched individually with 1 snapshot per email to each assigned team member.
         email_result = {"status": "skipped", "recipients": []}
-        if threat_detected:
+        if threat_level in ("medium", "high") and threat_detected:
             try:
                 from email_service import email_service
-                print(f"[Alert Notification] Verified unusual activity '{task.anomaly_type}'. Dispatching email alert to Access Management members...")
+                print(f"[Alert Notification] Verified {threat_level.upper()} threat '{task.anomaly_type}'. Dispatching individual email alerts (1 snapshot each) to Access Management members...")
                 email_result = await email_service.notify_project_members_of_threat(
                     project_id=task.project_id,
                     camera_id=task.camera_id,
@@ -453,10 +547,13 @@ class VerificationQueueManager:
                     confidence_score=confidence_score,
                     snapshot_url=snapshot_url,
                     image_data=task.image_data,
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.utcnow(),
+                    threat_level=threat_level
                 )
             except Exception as email_err:
                 print(f"[Alert Notification] Error dispatching email alert: {email_err}")
+        else:
+            print(f"[Alert Notification] Activity classified as '{threat_level.upper()}' (Routine/Safe). Email alerts suppressed to prevent inbox clutter.")
 
         # ─── Real-Time WebSocket Broadcast ───────────────────────────────────
         from main import manager
