@@ -300,10 +300,14 @@ def on_anomaly_detected(
     confidence: float,
     snapshot_filename: str,
     snapshot_path: str,
-    image_data: bytes
+    image_data: bytes,
+    capture_time: Optional[datetime] = None
 ):
     """Called from stream worker threads when YOLO detects anomalous behavior.
     Enqueues to the commercial Gemini multi-key rate-limiting queue."""
+    if capture_time is None:
+        capture_time = datetime.now(timezone.utc)
+
     task = VerificationTask(
         camera_id=camera_id,
         project_id=project_id,
@@ -312,7 +316,8 @@ def on_anomaly_detected(
         confidence_yolo=confidence,
         camera_name=camera_name,
         camera_zone_tag=zone_tag,
-        snapshot_filename=snapshot_filename
+        snapshot_filename=snapshot_filename,
+        capture_time=capture_time
     )
     try:
         import builtins

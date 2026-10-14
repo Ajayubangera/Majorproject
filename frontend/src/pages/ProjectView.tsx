@@ -525,8 +525,8 @@ export default function ProjectView() {
             threat_description: alertData.threat_description,
             confidence_score: alertData.confidence_gemini,
             is_resolved: alertData.is_resolved ?? false,
-            created_at: new Date().toISOString(),
-            timestamp: alertData.timestamp
+            created_at: alertData.timestamp || alertData.created_at || new Date().toISOString(),
+            timestamp: alertData.timestamp || alertData.created_at || new Date().toISOString()
           },
           ...prev
         ]);

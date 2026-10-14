@@ -43,19 +43,26 @@ export function getViolenceLevel(alert: any): ViolenceLevel {
   // - "...which does not constitute a threat."
   // These must be recognized as SAFE / NORMAL (low), NOT as affirmative weapons!
 
-  const negationRegex = /\b(no|without|neither|not any|free of|devoid of)\s+([a-z]+\s+)?(indicator|indicators|indication|indications|sign|signs|evidence|threat|trace|traces)\b/i;
-  const threatNegationRegex = /\b(not|does not|do not|doesn't|don't)\s+(constitute|indicate|suggest|appear to be|seem to be|represent)\s+(a\s+|an\s+|any\s+)?(threat|danger|hazard|anomaly|concern)\b/i;
+  // Direct sentence negations ("there is no running, violence, weapon...", "there are no...", "no suspicious activity")
+  const directNoPattern = /\b(there\s+is\s+no|there\s+are\s+no|no\s+(evidence|sign|signs|indication|indications|indicator|indicators|trace|traces|threat|active\s+threat|suspicious|violence|weapon|weapons|fighting|fire|smoke|running|loitering))\b/i;
+  const negationRegex = /\b(no|without|neither|not any|free of|devoid of)\s+([a-z\s,]+)?(indicator|indicators|indication|indications|sign|signs|evidence|threat|trace|traces|weapon|weapons|violence|running|fire|hazard)\b/i;
+  const threatNegationRegex = /\b(not|does not|do not|doesn't|don't)\s+(constitute|indicate|suggest|appear\s+to\s+be|seem\s+to\s+be|represent|show)\s+(a\s+|an\s+|any\s+)?(threat|danger|hazard|anomaly|concern|violence|weapon)\b/i;
   const explicitSafeRegex = /\b(normal|routine|safe|casual|harmless|peaceful|clear)\s+(room|indoor|outdoor|setting|environment|state|activity|scene|operation|monitoring)\b/i;
+  const safeEnvRoutinePattern = /\b(residential|office|indoor|room|home|workspace|setting|environment)\b/i.test(desc) &&
+    /\b(sitting|stationary|drinking|holding\s+a\s+glass|casual|casually|routine|harmless|peaceful|normal\s+operational)\b/i.test(desc) &&
+    !desc.includes("holding a knife") && !desc.includes("holding a gun");
 
   const normalIndicatorPhrases = [
     "normal operational", "normal operational state", "normal activity",
     "normal room", "normal monitoring", "normal environment", "normal setting", "normal state",
+    "residential or office", "office setting", "residential setting",
     "offline analysis", "not gemini verified", "offline simulation",
     "no indicator", "no indicators", "no indication", "no indications",
     "no visible sign", "no visible signs", "no sign", "no signs",
     "no evidence", "no threat", "no active threat", "no malicious",
+    "no running", "no violence", "no weapon", "no weapons", "no fire", "no smoke", "no suspicious",
     "not a threat", "not constitute a threat", "does not constitute a threat",
-    "casually looking", "looking around", "looking upwards",
+    "casually looking", "looking around", "looking upwards", "holding a glass",
     "false positive", "harmless", "routine activity", "simply posing"
   ];
 
@@ -63,6 +70,8 @@ export function getViolenceLevel(alert: any): ViolenceLevel {
     desc.includes("normal operational") ||
     desc.includes("offline analysis") ||
     desc.includes("normal state") ||
+    safeEnvRoutinePattern ||
+    directNoPattern.test(desc) ||
     negationRegex.test(desc) || 
     threatNegationRegex.test(desc) || 
     explicitSafeRegex.test(desc) ||

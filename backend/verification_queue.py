@@ -73,20 +73,54 @@ class VerificationTask:
     camera_zone_tag: str
     snapshot_filename: Optional[str] = None
     created_at: float = field(default_factory=time.time)
+    capture_time: Optional[datetime] = None
 
 
 # ─── Key Pool Manager ──────────────────────────────────────────────────────────
 
 class GeminiKeyPool:
-    """Manages rotation, pacing, and circuit-breaking across Gemini API keys."""
+    """Manages rotation, pacing, dynamic .env hot-reloading, and circuit-breaking across Gemini API keys."""
 
     def __init__(self, min_interval_per_key: float = 4.2):
         self.min_interval = min_interval_per_key  # 4.2s = max ~14.2 RPM (well below 15 RPM limit)
         self.keys: List[KeyState] = []
         self._lock = asyncio.Lock()
+        self._env_files: List[str] = [
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        ]
+        self._last_env_mtimes: Dict[str, float] = {}
+        self._last_env_check: float = 0.0
         self._load_keys()
 
-    def _load_keys(self):
+    def _check_and_reload_env(self, force: bool = False):
+        """
+        Dynamically hot-reloads .env if the file has been edited on disk,
+        or when all existing keys are exhausted/cooling down.
+        """
+        now = time.time()
+        # Throttle check to at most once every 3 seconds unless forced
+        if not force and (now - self._last_env_check < 3.0):
+            return
+
+        self._last_env_check = now
+        changed = False
+
+        for path in self._env_files:
+            if os.path.exists(path):
+                try:
+                    mtime = os.path.getmtime(path)
+                    if force or path not in self._last_env_mtimes or mtime > self._last_env_mtimes[path]:
+                        self._last_env_mtimes[path] = mtime
+                        load_dotenv(dotenv_path=path, override=True)
+                        changed = True
+                except Exception:
+                    pass
+
+        if changed or force:
+            self._sync_keys_from_env()
+
+    def _sync_keys_from_env(self):
         candidate_env_vars = [
             "GEMINI_API_KEY",
             "GEMINI_API_KEY_1",
@@ -95,25 +129,60 @@ class GeminiKeyPool:
             "GEMINI_API_KEY_4",
             "GEMINI_API_KEY_5"
         ]
-        seen_keys = set()
-        for idx, var in enumerate(candidate_env_vars):
-            k = os.getenv(var, "").strip()
-            if k and k not in seen_keys:
-                seen_keys.add(k)
-                self.keys.append(KeyState(key=k, index=idx))
+        existing_key_map = {k.index: k for k in self.keys}
+        seen_keys = set(k.key for k in self.keys)
+        new_or_updated = 0
 
+        for idx, var in enumerate(candidate_env_vars):
+            raw = os.getenv(var, "").strip()
+            if not raw:
+                continue
+
+            if idx in existing_key_map:
+                kstate = existing_key_map[idx]
+                # If key was updated in .env, reset cooldown and reactivate immediately
+                if kstate.key != raw:
+                    print(f"[GeminiPool] Detected updated {var} in .env! Resetting key #{idx} into active rotation.")
+                    kstate.key = raw
+                    kstate.cooldown_until = 0.0
+                    kstate.rate_limit_hits = 0
+                    new_or_updated += 1
+            else:
+                if raw not in seen_keys:
+                    seen_keys.add(raw)
+                    self.keys.append(KeyState(key=raw, index=idx))
+                    print(f"[GeminiPool] Detected new {var} in .env! Added key #{idx} to active pool.")
+                    new_or_updated += 1
+
+        if new_or_updated > 0:
+            print(f"[GeminiPool] Key pool refreshed from .env: {len(self.keys)} total keys configured.")
+
+    def _load_keys(self):
+        self._check_and_reload_env(force=True)
         print(f"[GeminiPool] Initialized pool with {len(self.keys)} active API keys.")
 
     async def acquire_key(self) -> Optional[KeyState]:
         """
         Returns the next available, healthy key that has rested for at least min_interval.
-        Returns None if all keys are currently cooling down.
+        If all keys are in cooldown, automatically checks .env for fresh keys.
+        Returns None only if all keys are genuinely in cooldown.
         """
         async with self._lock:
+            # 1. Hot-reload .env if modified on disk
+            self._check_and_reload_env(force=False)
+
             now = time.time()
-            # Filter keys not in cooldown
             available = [k for k in self.keys if not k.is_cooling_down]
+
+            # 2. If no keys are currently available, force an immediate .env reload check
             if not available:
+                self._check_and_reload_env(force=True)
+                available = [k for k in self.keys if not k.is_cooling_down]
+
+            if not available:
+                min_wait = min((k.cooldown_until - now for k in self.keys), default=0.0)
+                if min_wait > 0:
+                    print(f"[GeminiPool] All Gemini keys cooling down. Next auto-retry in {round(min_wait, 1)}s. Using fallback.")
                 return None
 
             # Sort by last_used (Least Recently Used first)
@@ -246,23 +315,31 @@ class VerificationQueueManager:
         anomaly = (anomaly_type or "").lower().strip()
 
         # Step 1: Explicit Normal / Safe Environment & Negation Checks (Top Priority)
-        # Gemini descriptions frequently say:
-        # - "There are no indicators of violence, unauthorized intrusion, weapons, fire/smoke, or suspicious loitering."
-        # - "There are no visible signs of violence, weapons, fire/smoke..."
+        # Handles direct sentence negations:
+        # - "There is no running, violence, weapon, fire, smoke, or any suspicious activity occurring."
+        # - "There are no indicators of violence, unauthorized intrusion, weapons..."
         # - "...which does not constitute a threat."
-        negation_pattern = r"\b(no|without|neither|not any|free of|devoid of)\s+([a-z]+\s+)?(indicator|indicators|indication|indications|sign|signs|evidence|threat|trace|traces)\b"
-        threat_negation_pattern = r"\b(not|does not|do not|doesn't|don't)\s+(constitute|indicate|suggest|appear to be|seem to be|represent)\s+(a\s+|an\s+|any\s+)?(threat|danger|hazard|anomaly|concern)\b"
+        direct_no_pattern = r"\b(there\s+is\s+no|there\s+are\s+no|no\s+(evidence|sign|signs|indication|indications|indicator|indicators|trace|traces|threat|active\s+threat|suspicious|violence|weapon|weapons|fighting|fire|smoke|running|loitering))\b"
+        negation_pattern = r"\b(no|without|neither|not any|free of|devoid of)\s+([a-z\s,]+)?(indicator|indicators|indication|indications|sign|signs|evidence|threat|trace|traces|weapon|weapons|violence|running|fire|hazard)\b"
+        threat_negation_pattern = r"\b(not|does not|do not|doesn't|don't)\s+(constitute|indicate|suggest|appear\s+to\s+be|seem\s+to\s+be|represent|show)\s+(a\s+|an\s+|any\s+)?(threat|danger|hazard|anomaly|concern|violence|weapon)\b"
         explicit_safe_pattern = r"\b(normal|routine|safe|casual|harmless|peaceful|clear)\s+(room|indoor|outdoor|setting|environment|state|activity|scene|operation|monitoring)\b"
+        safe_env_routine = (
+            bool(re.search(r"\b(residential|office|indoor|room|home|workspace|setting|environment)\b", desc, re.I)) and
+            bool(re.search(r"\b(sitting|stationary|drinking|holding\s+a\s+glass|casual|casually|routine|harmless|peaceful|normal\s+operational)\b", desc, re.I)) and
+            "holding a knife" not in desc and "holding a gun" not in desc
+        )
 
         normal_indicator_phrases = [
             "normal operational", "normal operational state", "normal activity",
             "normal room", "normal monitoring", "normal environment", "normal setting", "normal state",
+            "residential or office", "office setting", "residential setting",
             "offline analysis", "not gemini verified", "offline simulation",
             "no indicator", "no indicators", "no indication", "no indications",
             "no visible sign", "no visible signs", "no sign", "no signs",
             "no evidence", "no threat", "no active threat", "no malicious",
+            "no running", "no violence", "no weapon", "no weapons", "no fire", "no smoke", "no suspicious",
             "not a threat", "not constitute a threat", "does not constitute a threat",
-            "casually looking", "looking around", "looking upwards",
+            "casually looking", "looking around", "looking upwards", "holding a glass",
             "false positive", "harmless", "routine activity", "simply posing"
         ]
 
@@ -270,6 +347,8 @@ class VerificationQueueManager:
             "normal operational" in desc or
             "offline analysis" in desc or
             "normal state" in desc or
+            safe_env_routine or
+            bool(re.search(direct_no_pattern, desc, re.IGNORECASE)) or
             bool(re.search(negation_pattern, desc, re.IGNORECASE)) or
             bool(re.search(threat_negation_pattern, desc, re.IGNORECASE)) or
             bool(re.search(explicit_safe_pattern, desc, re.IGNORECASE)) or
@@ -348,8 +427,9 @@ class VerificationQueueManager:
                 from langchain_google_genai import ChatGoogleGenerativeAI
                 from langchain_core.messages import HumanMessage
 
+                gemini_model = os.getenv("GEMINI_MODEL", "gemini-flash-lite-latest")
                 llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash",
+                    model=gemini_model,
                     google_api_key=key_state.key,
                     temperature=0.1,
                     max_output_tokens=512,
@@ -363,7 +443,12 @@ class VerificationQueueManager:
 
                 loop = asyncio.get_event_loop()
                 response = await loop.run_in_executor(None, lambda: llm.invoke([message]))
-                resp_text = response.content.strip()
+                
+                # Robust extraction handling string, list of content dicts, or objects
+                if isinstance(response.content, list):
+                    resp_text = "".join(item.get("text", "") if isinstance(item, dict) else str(item) for item in response.content).strip()
+                else:
+                    resp_text = str(response.content).strip()
 
                 if resp_text.startswith("```"):
                     lines = resp_text.splitlines()
@@ -414,8 +499,10 @@ class VerificationQueueManager:
                     )
 
                     loop = asyncio.get_event_loop()
-                    response = await loop.run_in_executor(None, lambda: llm.invoke([message]))
-                    resp_text = response.content.strip()
+                    if isinstance(response.content, list):
+                        resp_text = "".join(item.get("text", "") if isinstance(item, dict) else str(item) for item in response.content).strip()
+                    else:
+                        resp_text = str(response.content).strip()
 
                     if resp_text.startswith("```"):
                         lines = resp_text.splitlines()
@@ -489,6 +576,9 @@ class VerificationQueueManager:
         is_routine_normal = (threat_level == "low")
         print(f"[Verification] Assessment: tier='{threat_level.upper()}', raw_threat={threat_detected}, anomaly='{task.anomaly_type}'")
 
+        # Preserve exact capture time from when frame anomaly was detected
+        task_time = task.capture_time or datetime.fromtimestamp(task.created_at, tz=timezone.utc)
+
         # ─── Database Alert Record ────────────────────────────────────────────
         alert_id = None
         async with AsyncSessionLocal() as session:
@@ -501,7 +591,7 @@ class VerificationQueueManager:
                     confidence_score=confidence_score,
                     anomaly_type=task.anomaly_type,
                     is_resolved=is_routine_normal or (not threat_detected),
-                    created_at=datetime.now(timezone.utc)
+                    created_at=task_time
                 )
                 session.add(alert_record)
 
@@ -547,7 +637,7 @@ class VerificationQueueManager:
                     confidence_score=confidence_score,
                     snapshot_url=snapshot_url,
                     image_data=task.image_data,
-                    timestamp=datetime.utcnow(),
+                    timestamp=task_time,
                     threat_level=threat_level
                 )
             except Exception as email_err:
@@ -568,7 +658,8 @@ class VerificationQueueManager:
                 "anomaly_type": task.anomaly_type,
                 "threat_description": threat_description,
                 "snapshot_url": snapshot_url,
-                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "timestamp": task_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "created_at": task_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "alert_id": alert_id,
                 "is_resolved": not threat_detected,
                 "email_status": email_result.get("status"),

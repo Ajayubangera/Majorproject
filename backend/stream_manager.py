@@ -23,6 +23,7 @@ import time
 import uuid
 import threading
 import asyncio
+from datetime import datetime, timezone
 import numpy as np
 from typing import Dict, Optional, Callable
 from collections import defaultdict, deque
@@ -260,10 +261,11 @@ class CameraStreamWorker:
                     anomalies = self.tracker.get_anomalies(detections)
                     if anomalies and (time.time() - self._last_anomaly_time) >= self._anomaly_cooldown:
                         self._last_anomaly_time = time.time()
+                        capture_time = datetime.now(timezone.utc)
                         # Run anomaly handler in a background thread to keep inference responsive
                         threading.Thread(
                             target=self._handle_anomaly, 
-                            args=(frame_to_process.copy(), anomalies), 
+                            args=(frame_to_process.copy(), anomalies, capture_time), 
                             daemon=True
                         ).start()
 
@@ -468,7 +470,8 @@ class CameraStreamWorker:
                     def mjpeg_grabber():
                         buffer = b""
                         try:
-                            for chunk in response.iter_content(chunk_size=4096):
+                            # 64KB chunks to aggressively drain TCP socket buffers and prevent video lag
+                            for chunk in response.iter_content(chunk_size=65536):
                                 if not self._running or not grabber_state["running"]:
                                     break
                                 if not chunk:
@@ -478,6 +481,7 @@ class CameraStreamWorker:
                                 with grabber_lock:
                                     grabber_state["last_chunk_time"] = time.time()
 
+                                latest_jpeg = None
                                 while True:
                                     start = buffer.find(b"\xff\xd8")
                                     if start == -1:
@@ -494,11 +498,13 @@ class CameraStreamWorker:
                                             buffer = b""
                                         break
 
-                                    jpeg_data = buffer[:end + 2]
+                                    # Found complete JPEG; advance latest_jpeg so backlogged frames are skipped
+                                    latest_jpeg = buffer[:end + 2]
                                     buffer = buffer[end + 2:]
 
+                                if latest_jpeg is not None:
                                     with grabber_lock:
-                                        grabber_state["jpeg_data"] = jpeg_data
+                                        grabber_state["jpeg_data"] = latest_jpeg
                         except Exception as e:
                             print(f"[StreamManager] Camera '{self.camera_name}' MJPEG grabber disconnected: {e}")
                         finally:
@@ -631,7 +637,7 @@ class CameraStreamWorker:
                 print(f"[StreamManager] Camera '{self.camera_name}': Stream disconnected, auto-reconnecting in {delay}s (attempt {self._reconnect_count})...")
                 time.sleep(delay)
 
-    def _handle_anomaly(self, original_frame: np.ndarray, anomalies: list):
+    def _handle_anomaly(self, original_frame: np.ndarray, anomalies: list, capture_time: Optional[datetime] = None):
         """
         Handle detected anomaly:
         1. Encode original native resolution snapshot into memory (no local disk save)
@@ -639,6 +645,9 @@ class CameraStreamWorker:
         """
         if not anomalies:
             return
+
+        if capture_time is None:
+            capture_time = datetime.now(timezone.utc)
 
         # Pick the highest-priority anomaly
         primary = anomalies[0]
@@ -664,7 +673,8 @@ class CameraStreamWorker:
                     confidence=primary["confidence"],
                     snapshot_filename=snapshot_filename,
                     snapshot_path="",
-                    image_data=jpeg_data
+                    image_data=jpeg_data,
+                    capture_time=capture_time
                 )
             except Exception as e:
                 print(f"[StreamManager] Anomaly callback error: {e}")
